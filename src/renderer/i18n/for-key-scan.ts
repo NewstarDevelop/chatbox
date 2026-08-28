@@ -16,10 +16,10 @@
 function _errorI18nKeys(t: (key: string) => string) {
   // BEGIN GENERATED ERROR I18N KEYS
   t(
-    'You have reached your monthly quota for the {{model}} model. Please <OpenSettingButton>go to Settings</OpenSettingButton> to switch to a different model, view your quota usage, or upgrade your plan.'
+    'You have used up your monthly Chatbox AI quota. Please <OpenSettingButton>go to Settings</OpenSettingButton> to view your quota usage or upgrade your plan.'
   )
   t(
-    'You have reached your daily quota for the {{model}} model. Please <OpenSettingButton>go to Settings</OpenSettingButton> to switch to a different model, view your quota usage, or upgrade your plan.'
+    'You have used up your daily Chatbox AI quota. Please <OpenSettingButton>go to Settings</OpenSettingButton> to view your quota usage or upgrade your plan.'
   )
   t(
     'Your current License (Chatbox AI Free/Lite) does not support the {{model}} model. To use this model, please <OpenMorePlanButton>upgrade</OpenMorePlanButton> to Chatbox AI Pro or a higher-tier package. Alternatively, you can switch to a different model by <OpenSettingButton>accessing the settings</OpenSettingButton>.'
@@ -105,6 +105,7 @@ function _errorI18nKeys(t: (key: string) => string) {
   t(
     'This file type requires a document parser. Please go to <OpenDocumentParserSettingButton>Settings</OpenDocumentParserSettingButton> and enable Chatbox AI document parsing.'
   )
+  t('Device storage is full. Free up some space, then try attaching the file again.')
   t(
     'You have selected BoCha as the search provider, but an API key has not been entered yet. Please <OpenExtensionSettingButton>click here to open Settings</OpenExtensionSettingButton> and enter your API key, or choose a different search provider.'
   )
@@ -112,6 +113,9 @@ function _errorI18nKeys(t: (key: string) => string) {
   t(
     'The current search provider does not support reading webpages. Please <OpenExtensionSettingButton>choose a different search provider</OpenExtensionSettingButton> that supports this capability.'
   )
+  t('Failed to parse file. Please try again or use a different file format.')
+  t('No readable content was found in this attachment. Please check the file and try again.')
+  t('Your points are used up. Claim free reward quota to continue.')
   // END GENERATED ERROR I18N KEYS
 
   // HTTP status code errors (MessageErrTips.tsx)
@@ -150,18 +154,22 @@ function _otherI18nKeys(t: (key: string) => string) {
   t('Keyboard Shortcuts')
   t('General Settings')
 
+  // src/shared/theme-colors.ts, rendered dynamically in settings/general.tsx
+  t('Claude Classic')
+  t('Mist Blue')
+
   // src/renderer/components/common/MessageLayoutPreview.tsx
-  t('Classic')
-  t('Bubble')
+  t('Left-aligned')
+  t('Chat bubbles')
 
   // src/renderer/modals/ExportChat.tsx
   t('All threads')
   t('Current thread')
 
   // src/renderer/components/settings/DocumentParserSettings.tsx
-  t('Text Only')
   t('Local')
   t('MinerU')
+  t('No points consumed')
   t(
     'Only supports basic text files (.txt, .md, .json, code files, etc.). For PDF and Office files, please switch to Chatbox AI.'
   )
@@ -170,6 +178,9 @@ function _otherI18nKeys(t: (key: string) => string) {
   )
   t(
     'Cloud-based document parsing service, supports PDF, Office files, EPUB and many other file types. Consumes compute points.'
+  )
+  t(
+    'Tries local parsing first without consuming compute points. If local parsing fails, Chatbox AI cloud parsing will be used and compute points will be consumed.'
   )
   t('Third-party cloud parsing service, supports PDF and most Office files. Requires API token.')
 

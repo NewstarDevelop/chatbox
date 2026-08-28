@@ -1,5 +1,7 @@
-import { Box, Button, FileButton, Flex, Slider, Stack, Switch, Text, Textarea, Title, Tooltip } from '@mantine/core'
+import { Box, Button, FileButton, Flex, Slider, Stack, Switch, Text, Textarea, Title } from '@mantine/core'
+import { TestId } from '@shared/automation/testids'
 import { chatSessionSettings, getDefaultPrompt } from '@shared/defaults'
+import { MAX_TOOL_CALLS_BEFORE_CONFIRMATION } from '@shared/utils/tool-call-limit-pause'
 import { IconInfoCircle } from '@tabler/icons-react'
 import { createFileRoute } from '@tanstack/react-router'
 import { useMemo } from 'react'
@@ -11,6 +13,7 @@ import { MessageLayoutSelector } from '@/components/common/MessageLayoutPreview'
 import { ScalableIcon } from '@/components/common/ScalableIcon'
 import SliderWithInput from '@/components/common/SliderWithInput'
 import { handleImageInputAndSave, ImageInStorage } from '@/components/Image'
+import { AppTooltip as Tooltip } from '@/components/ui/tooltip'
 import storage from '@/storage'
 import { StorageKeyGenerator } from '@/storage/StoreStorage'
 import { useSettingsStore } from '@/stores/settingsStore'
@@ -160,7 +163,9 @@ export function RouteComponent() {
         <MaxContextMessageCountSlider
           wrapperProps={{ gap: 'xxs' }}
           labelProps={{ fw: undefined }}
-          value={settings?.maxContextMessageCount ?? chatSessionSettings().maxContextMessageCount!}
+          value={
+            settings?.maxContextMessageCount ?? chatSessionSettings().maxContextMessageCount ?? Number.MAX_SAFE_INTEGER
+          }
           onChange={(v) => setSettings({ maxContextMessageCount: v })}
         />
 
@@ -176,7 +181,6 @@ export function RouteComponent() {
               maw={320}
               className="!whitespace-normal"
               zIndex={3000}
-              events={{ hover: true, focus: true, touch: true }}
             >
               <ScalableIcon icon={IconInfoCircle} size={20} className="text-chatbox-tint-tertiary" />
             </Tooltip>
@@ -197,7 +201,6 @@ export function RouteComponent() {
               maw={320}
               className="!whitespace-normal"
               zIndex={3000}
-              events={{ hover: true, focus: true, touch: true }}
             >
               <ScalableIcon icon={IconInfoCircle} size={20} className="text-chatbox-tint-tertiary" />
             </Tooltip>
@@ -247,6 +250,18 @@ export function RouteComponent() {
               )}
             </Flex>
           </Flex>
+          {!!settings.backgroundImageKey && (
+            <Stack gap="xxs">
+              <Text size="sm">{t('Background Image Opacity')}</Text>
+              <SliderWithInput
+                value={Math.round(settings.backgroundImageOpacity * 100)}
+                onChange={(value) => setSettings({ backgroundImageOpacity: (value ?? 16) / 100 })}
+                max={100}
+                step={1}
+                suffix="%"
+              />
+            </Stack>
+          )}
         </Stack>
 
         {/* Stream output */}
@@ -272,7 +287,7 @@ export function RouteComponent() {
           <Text c="chatbox-tertiary">{t('Display')}</Text>
 
           <MessageLayoutSelector
-            value={settings.messageLayout ?? 'left'}
+            value={settings.messageLayout ?? 'bubble'}
             onValueChange={(val) => setSettings({ messageLayout: val })}
           />
 
@@ -367,6 +382,20 @@ export function RouteComponent() {
               setSettings({
                 ...settings,
                 autoGenerateTitle: !settings.autoGenerateTitle,
+              })
+            }
+          />
+          <Switch
+            data-testid={TestId.settings.pauseOnToolCallLimitSwitch}
+            label={t('Pause after every {{count}} steps', { count: MAX_TOOL_CALLS_BEFORE_CONFIRMATION })}
+            checked={settings.pauseOnToolCallLimit ?? true}
+            description={t(
+              "Long tasks pause for confirmation after every {{count}} steps so you can check they're on track. Individual chats can override this in their conversation settings.",
+              { count: MAX_TOOL_CALLS_BEFORE_CONFIRMATION }
+            )}
+            onChange={() =>
+              setSettings({
+                pauseOnToolCallLimit: !(settings.pauseOnToolCallLimit ?? true),
               })
             }
           />
@@ -489,7 +518,6 @@ function ContextManagementSection() {
               maw={320}
               className="!whitespace-normal"
               zIndex={3000}
-              events={{ hover: true, focus: true, touch: true }}
             >
               <ScalableIcon icon={IconInfoCircle} size={20} className="text-chatbox-tint-tertiary" />
             </Tooltip>
@@ -520,7 +548,6 @@ function ContextManagementSection() {
             maw={320}
             className="!whitespace-normal"
             zIndex={3000}
-            events={{ hover: true, focus: true, touch: true }}
           >
             <ScalableIcon icon={IconInfoCircle} size={20} className="text-chatbox-tint-tertiary" />
           </Tooltip>

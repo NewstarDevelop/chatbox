@@ -1,17 +1,3 @@
-import { type RemoteConfig, Theme } from '@shared/types'
-import { z } from 'zod'
-import { ErrorBoundary } from '@/components/common/ErrorBoundary'
-import Toasts from '@/components/common/Toasts'
-import DesktopDownloadReminder from '@/components/layout/DesktopDownloadReminder'
-import ExitFullscreenButton from '@/components/layout/ExitFullscreenButton'
-import useAppTheme from '@/hooks/useAppTheme'
-import { useSystemLanguageWhenInit } from '@/hooks/useDefaultSystemLanguage'
-import { useI18nEffect } from '@/hooks/useI18nEffect'
-import useNeedRoomForWinControls from '@/hooks/useNeedRoomForWinControls'
-import { useSidebarWidth } from '@/hooks/useScreenChange'
-import useShortcut from '@/hooks/useShortcut'
-import useVersion from '@/hooks/useVersion'
-import '@/modals'
 import NiceModal from '@ebay/nice-modal-react'
 import {
   Avatar,
@@ -36,18 +22,31 @@ import {
   Text,
   TextInput,
   Title,
-  Tooltip,
   useMantineColorScheme,
 } from '@mantine/core'
 import { Box, Grid } from '@mui/material'
 import CssBaseline from '@mui/material/CssBaseline'
 import { ThemeProvider } from '@mui/material/styles'
+import { type RemoteConfig, Theme } from '@shared/types'
 import { useQuery } from '@tanstack/react-query'
 import { createRootRoute, Outlet, useLocation } from '@tanstack/react-router'
-import { useAtomValue, useSetAtom } from 'jotai'
+import { useSetAtom } from 'jotai'
 import { useEffect, useMemo, useRef } from 'react'
 import { trackJkViewEvent } from '@/analytics/jk'
 import { JK_EVENTS, JK_PAGE_NAMES } from '@/analytics/jk-events'
+import { AppProviders } from '@/components/AppProviders'
+import { ErrorBoundary } from '@/components/common/ErrorBoundary'
+import Toasts from '@/components/common/Toasts'
+import DesktopDownloadReminder from '@/components/layout/DesktopDownloadReminder'
+import ExitFullscreenButton from '@/components/layout/ExitFullscreenButton'
+import useAppTheme from '@/hooks/useAppTheme'
+import { useSystemLanguageWhenInit } from '@/hooks/useDefaultSystemLanguage'
+import { useI18nEffect } from '@/hooks/useI18nEffect'
+import useNeedRoomForWinControls from '@/hooks/useNeedRoomForWinControls'
+import useScreenChange, { useSidebarWidth } from '@/hooks/useScreenChange'
+import useShortcut from '@/hooks/useShortcut'
+import useVersion from '@/hooks/useVersion'
+import '@/modals'
 import SettingsModal, { navigateToSettings } from '@/modals/Settings'
 import { prefetchModelRegistry } from '@/packages/model-registry'
 import { getOS } from '@/packages/navigator'
@@ -65,7 +64,6 @@ import { initOnboardingStore, onboardingStore } from '@/stores/onboardingStore'
 import * as premiumActions from '@/stores/premiumActions'
 import * as settingActions from '@/stores/settingActions'
 import { initSettingsStore, settingsStore, useLanguage, useSettingsStore, useTheme } from '@/stores/settingsStore'
-import { getTaskSession } from '@/stores/taskSessionStore'
 import { useUIStore } from '@/stores/uiStore'
 import { CHATBOX_BUILD_CHANNEL, CHATBOX_BUILD_PLATFORM } from '@/variables'
 import { blobToDataUrl } from './image-creator/-components/constants'
@@ -73,6 +71,7 @@ import { blobToDataUrl } from './image-creator/-components/constants'
 function BackgroundImageOverlay() {
   const location = useLocation()
   const globalBackgroundImageKey = useSettingsStore((s) => s.backgroundImageKey)
+  const backgroundImageOpacity = useSettingsStore((s) => s.backgroundImageOpacity)
   const showSidebar = useUIStore((s) => s.showSidebar)
   const sidebarWidth = useSidebarWidth()
   const isRootPage = location.pathname === '/'
@@ -108,11 +107,12 @@ function BackgroundImageOverlay() {
   return (
     <div className="absolute z-0 top-0 left-0 w-full h-full">
       <div
-        className="absolute top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat opacity-[0.16]"
+        className="absolute top-0 left-0 w-full h-full bg-cover bg-center bg-no-repeat"
         style={{
           backgroundImage: `
           url("${imageUrl.replace(/"/g, '%22')}")
         `,
+          opacity: backgroundImageOpacity,
         }}
       />
       <div className="hidden sm:block absolute top-0 left-0 w-full h-40 bg-gradient-to-b from-chatbox-background-primary from-0 to-transparent to-100%" />
@@ -125,7 +125,7 @@ function BackgroundImageOverlay() {
         />
       )}
 
-      <Flex h={48} className="sm:hidden bg-chatbox-background-primary" />
+      <Flex h={54} className="sm:hidden bg-chatbox-background-primary" />
 
       <Flex className="sm:hidden relative h-36 bg-gradient-to-b from-chatbox-background-primary from-0 to-transparent to-100%" />
 
@@ -134,11 +134,26 @@ function BackgroundImageOverlay() {
   )
 }
 
+function useHasBackgroundImage() {
+  const location = useLocation()
+  const globalBackgroundImageKey = useSettingsStore((s) => s.backgroundImageKey)
+  const isRootPage = location.pathname === '/'
+  const isSessionPage = location.pathname.startsWith('/session/') && location.pathname.length > '/session/'.length
+  const sessionId =
+    isSessionPage && location.pathname !== '/session/new' ? location.pathname.slice('/session/'.length) : null
+  const { session } = useSession(sessionId)
+
+  return (isRootPage || isSessionPage) && Boolean(session?.backgroundImage ?? globalBackgroundImageKey)
+}
+
 function Root() {
+  useScreenChange()
+
   const { isExceeded, isExceededResolved } = useVersion()
   const location = useLocation()
   const spellCheck = useSettingsStore((state) => state.spellCheck)
   const language = useLanguage()
+  const hasBackgroundImage = useHasBackgroundImage()
   const initialized = useRef(false)
 
   const setOpenAboutDialog = useUIStore((s) => s.setOpenAboutDialog)
@@ -160,8 +175,12 @@ function Root() {
         .catch(() => ({ setting_chatboxai_first: false }) as RemoteConfig)
       setRemoteConfig(async (prev) => ({ ...(await prev), ...remoteConfig }))
 
-      // Skip guide-related checks if already on guide or settings/mcp page
-      if (location.pathname === '/guide' || location.pathname === '/settings/mcp') {
+      // Skip guide-related checks if already on guide, dev tools, or settings/mcp page
+      if (
+        location.pathname === '/guide' ||
+        location.pathname.startsWith('/dev') ||
+        location.pathname === '/settings/mcp'
+      ) {
         initialized.current = true
         return
       }
@@ -222,10 +241,10 @@ function Root() {
       const sid = JSON.parse(localStorage.getItem('_currentSessionIdCachedAtom') || '""') as string
       if (sid && startupPage === 'session') {
         router.navigate({
-          to: '/session/$sessionId',
-          params: { sessionId: sid },
-          search: (prev) => prev,
+          to: `/session/${sid}`,
           replace: true,
+          params: (current) => current,
+          search: (current) => current,
         })
       }
     })()
@@ -242,23 +261,15 @@ function Root() {
           const settingsPath = path.substring('/settings'.length)
           navigateToSettings(settingsPath || '/')
         } else {
-          router.navigate({ to: path as '/', search: (prev) => prev })
+          router.navigate({
+            to: path,
+            params: (current) => current,
+            search: (current) => current,
+          })
         }
       })
     }
   }, [])
-
-  // Route → sidebar mode sync
-  const setSidebarMode = useUIStore((s) => s.setSidebarMode)
-  useEffect(() => {
-    const pathname = location.pathname
-    if (pathname === '/task' || pathname.startsWith('/task/')) {
-      setSidebarMode('task')
-    } else if (pathname === '/' || pathname.startsWith('/session/')) {
-      setSidebarMode('chat')
-    }
-    // Other routes (settings, copilots, about, etc.) don't change sidebarMode
-  }, [location.pathname, setSidebarMode])
 
   // Page view tracking
   const settingsSearch = (location.search as Record<string, unknown>)?.settings as string | undefined
@@ -271,8 +282,6 @@ function Root() {
       pageName = JK_PAGE_NAMES.SETTING_PAGE
     } else if (pathname === '/' || pathname.startsWith('/session/')) {
       pageName = JK_PAGE_NAMES.CHAT_PAGE
-    } else if (pathname === '/task' || pathname.startsWith('/task/')) {
-      pageName = JK_PAGE_NAMES.TASK_PAGE
     } else if (pathname.startsWith('/image-creator')) {
       pageName = JK_PAGE_NAMES.IMAGE_PAGE
     } else if (pathname.startsWith('/copilots')) {
@@ -294,10 +303,6 @@ function Root() {
         const sessionId = pathname.slice('/session/'.length)
         const session = await getSession(sessionId).catch(() => null)
         content = session?.name
-      } else if (pathname.startsWith('/task/') && pathname.length > '/task/'.length) {
-        const taskId = pathname.slice('/task/'.length)
-        const taskSession = await getTaskSession(taskId).catch(() => null)
-        content = taskSession?.name
       }
 
       trackJkViewEvent(JK_EVENTS.PAGE_VIEW, {
@@ -320,15 +325,26 @@ function Root() {
   }, [needRoomForMacWindowControls])
 
   return (
-    <Box className="box-border App relative" spellCheck={spellCheck} dir={language === 'ar' ? 'rtl' : 'ltr'}>
+    <Box
+      className="box-border App relative bg-chatbox-background-primary"
+      spellCheck={spellCheck}
+      dir={language === 'ar' ? 'rtl' : 'ltr'}
+    >
       <BackgroundImageOverlay />
       {platform.type === 'desktop' && (getOS() === 'Windows' || getOS() === 'Linux') && <ExitFullscreenButton />}
       <Grid container className="h-full relative z-[1]">
         <Sidebar />
         <Box
-          className="h-full w-full"
+          className="relative h-full w-full box-border"
           sx={{
             flexGrow: 1,
+            transition: (theme) =>
+              theme.transitions.create('padding', {
+                easing: showSidebar ? theme.transitions.easing.easeOut : theme.transitions.easing.sharp,
+                duration: showSidebar
+                  ? theme.transitions.duration.enteringScreen
+                  : theme.transitions.duration.leavingScreen,
+              }),
             ...(showSidebar
               ? language === 'ar'
                 ? { paddingRight: { sm: `${sidebarWidth}px` } }
@@ -336,9 +352,37 @@ function Root() {
               : {}),
           }}
         >
-          <ErrorBoundary name="main">
-            <Outlet />
-          </ErrorBoundary>
+          <Box
+            className="title-bar absolute inset-x-0 top-0 hidden sm:block"
+            sx={{ height: showSidebar ? '10px' : '5px' }}
+          />
+          <Box
+            className="h-full box-border"
+            sx={{
+              padding: { xs: 0, sm: showSidebar ? '10px 10px 10px 0' : '5px' },
+              transition: (theme) =>
+                theme.transitions.create('padding', {
+                  easing: showSidebar ? theme.transitions.easing.easeOut : theme.transitions.easing.sharp,
+                  duration: showSidebar
+                    ? theme.transitions.duration.enteringScreen
+                    : theme.transitions.duration.leavingScreen,
+                }),
+            }}
+          >
+            <Box
+              className={`h-full overflow-hidden border-[0.5px] border-solid border-chatbox-border-primary ${
+                hasBackgroundImage ? 'bg-transparent' : 'bg-chatbox-background-primary'
+              }`}
+              sx={{
+                borderRadius: { xs: 0, sm: '16px' },
+                boxShadow: { xs: 'none', sm: '0 0 22px rgba(0, 0, 0, 0.11)' },
+              }}
+            >
+              <ErrorBoundary name="main">
+                <Outlet />
+              </ErrorBoundary>
+            </Box>
+          </Box>
         </Box>
       </Grid>
       {/* 对话设置 */}
@@ -378,6 +422,7 @@ const creteMantineTheme = (scale = 1) =>
   createTheme({
     /** Put your mantine theme override here */
     scale,
+    defaultRadius: 'lg',
     primaryColor: 'chatbox-brand',
     colors: {
       'chatbox-brand': colorsTuple(Array.from({ length: 10 }, () => 'var(--chatbox-tint-brand)')),
@@ -581,6 +626,7 @@ const creteMantineTheme = (scale = 1) =>
           },
           overlay: {
             '--overlay-bg': 'var(--chatbox-background-mask-overlay)',
+            '--overlay-filter': 'blur(4px)',
           },
         }),
       }),
@@ -620,11 +666,6 @@ const creteMantineTheme = (scale = 1) =>
           },
         }),
       }),
-      Tooltip: Tooltip.extend({
-        defaultProps: {
-          zIndex: 3000,
-        },
-      }),
       Popover: Popover.extend({
         defaultProps: {
           zIndex: 3000,
@@ -640,9 +681,6 @@ const creteMantineTheme = (scale = 1) =>
   })
 
 export const Route = createRootRoute({
-  validateSearch: z.object({
-    settings: z.string().optional(),
-  }),
   component: () => {
     useI18nEffect()
     premiumActions.useAutoValidate() // 每次启动都执行 license 检查，防止用户在lemonsqueezy管理页面中取消了当前设备的激活
@@ -661,14 +699,16 @@ export const Route = createRootRoute({
         theme={mantineTheme}
         defaultColorScheme={_theme === Theme.Dark ? 'dark' : _theme === Theme.Light ? 'light' : 'auto'}
       >
-        <ThemeProvider theme={theme}>
-          <CssBaseline />
-          <NiceModal.Provider>
-            <ErrorBoundary>
-              <Root />
-            </ErrorBoundary>
-          </NiceModal.Provider>
-        </ThemeProvider>
+        <AppProviders>
+          <ThemeProvider theme={theme}>
+            <CssBaseline />
+            <NiceModal.Provider>
+              <ErrorBoundary>
+                <Root />
+              </ErrorBoundary>
+            </NiceModal.Provider>
+          </ThemeProvider>
+        </AppProviders>
       </MantineProvider>
     )
   },

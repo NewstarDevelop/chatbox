@@ -1,16 +1,18 @@
-import { Button, Flex, PasswordInput, Select, Stack, Text, Title, Tooltip } from '@mantine/core'
+import { Button, Flex, PasswordInput, Select, Stack, Text, Title } from '@mantine/core'
 import { IconCheck, IconX } from '@tabler/icons-react'
 import { createFileRoute } from '@tanstack/react-router'
 import { ofetch } from 'ofetch'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { AdaptiveSelect } from '@/components/AdaptiveSelect'
-import { PROVIDERS_WITH_PARSE_LINK } from '@/packages/web-search'
-import { BochaSearch } from '@/packages/web-search/bocha'
-import { QUERIT_SEARCH_URL } from '@/packages/web-search/querit'
-import platform from '@/platform'
 import { trackJkClickEvent } from '@/analytics/jk'
 import { JK_EVENTS, JK_PAGE_NAMES } from '@/analytics/jk-events'
+import { AdaptiveSelect } from '@/components/AdaptiveSelect'
+import { AppTooltip as Tooltip } from '@/components/ui/tooltip'
+import { PROVIDERS_WITH_PARSE_LINK } from '@/packages/web-search'
+import { BochaSearch } from '@/packages/web-search/bocha'
+import { WEB_SEARCH_PROVIDERS } from '@/packages/web-search/constants'
+import { QUERIT_SEARCH_URL } from '@/packages/web-search/querit'
+import platform from '@/platform'
 import { useSettingsStore } from '@/stores/settingsStore'
 
 export const Route = createFileRoute('/settings/web-search')({
@@ -99,13 +101,7 @@ export function RouteComponent() {
 
       <AdaptiveSelect
         comboboxProps={{ withinPortal: true, withArrow: true }}
-        data={[
-          { value: 'build-in', label: 'Chatbox AI' },
-          { value: 'bing', label: 'Bing Search (Free)' },
-          { value: 'tavily', label: 'Tavily' },
-          { value: 'bocha', label: 'BoCha' },
-          { value: 'querit', label: 'Querit' },
-        ]}
+        data={WEB_SEARCH_PROVIDERS.map((p) => ({ value: p.value, label: p.label }))}
         value={extension.webSearch.provider}
         onChange={(e) =>
           e &&

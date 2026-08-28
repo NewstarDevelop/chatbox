@@ -1,11 +1,21 @@
 import NiceModal from '@ebay/nice-modal-react'
-import { ActionIcon, type ActionIconProps, Flex, Image as Img, Loader, Text, Tooltip as Tooltip1 } from '@mantine/core'
+import { ActionIcon, type ActionIconProps, Button, Flex, Loader, Modal, Stack, Text } from '@mantine/core'
 import { Box, Grid, useTheme } from '@mui/material'
-import type { Message, MessagePicture, MessageToolCallPart, SessionType } from '@shared/types'
+import { TestId } from '@shared/automation/testids'
+import { findMessageLocation } from '@shared/session/message-forks'
+import type {
+  Message,
+  MessageBackgroundTask,
+  MessageReasoningPart,
+  MessageTextPart,
+  MessageToolCallPart,
+  SessionType,
+} from '@shared/types'
 import { getMessageText } from '@shared/utils/message'
 import {
   IconArrowDown,
-  IconBug,
+  IconChevronDown,
+  IconClockHour3,
   IconCode,
   IconCopy,
   IconDotsVertical,
@@ -13,45 +23,97 @@ import {
   IconMessageReport,
   IconPencil,
   IconPhotoPlus,
+  IconPlayerStopFilled,
   type IconProps,
   IconQuoteFilled,
   IconReload,
+  IconRobot,
   IconTrash,
 } from '@tabler/icons-react'
-import { useQuery } from '@tanstack/react-query'
 import clsx from 'clsx'
 import * as dateFns from 'date-fns'
-import { concat } from 'lodash'
-import type { UIElementData } from 'photoswipe'
 import type React from 'react'
-import { type FC, forwardRef, type MouseEventHandler, memo, useCallback, useMemo, useRef, useState } from 'react'
+import {
+  type FC,
+  Fragment,
+  forwardRef,
+  type MouseEventHandler,
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { useTranslation } from 'react-i18next'
-import { Gallery, Item as GalleryItem } from 'react-photoswipe-gallery'
+import { trackAgentModeSuggestionAction } from '@/analytics/agent-mode'
 import { trackJkClickEvent } from '@/analytics/jk'
 import { JK_EVENTS, JK_PAGE_NAMES } from '@/analytics/jk-events'
 import Markdown from '@/components/Markdown'
-import { useFetchBlob } from '@/hooks/useBlob'
+import StreamingTextFade from '@/components/StreamingTextFade'
+import { AppTooltip as Tooltip1 } from '@/components/ui/tooltip'
 import { useIsSmallScreen } from '@/hooks/useScreenChange'
+import { formatElapsedTime } from '@/hooks/useThinkingTimer'
 import { cn } from '@/lib/utils'
 import { navigateToSettings } from '@/modals/Settings'
 import { copyToClipboard } from '@/packages/navigator'
 import { countWord } from '@/packages/word-count'
-import platform from '@/platform'
 import { getSession } from '@/stores/chatStore'
+import { lockSessionAgentMode, setSessionAgentMode } from '@/stores/session/agent-mode'
+import { isCancellableGeneratingAssistantMessage } from '@/stores/session/generation-state'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useUIStore } from '@/stores/uiStore'
 import '../../static/Block.css'
-import { generateMore, modifyMessage, regenerateInNewFork, removeMessage } from '@/stores/sessionActions'
+import {
+  generate,
+  generateMore,
+  isRetryableToolCallStep,
+  modifyMessage,
+  regenerateInNewFork,
+  removeMessage,
+  retryFromLastToolCallAfterApiError,
+  stopGeneratingMessages,
+} from '@/stores/sessionActions'
 import * as toastActions from '@/stores/toastActions'
 import ActionMenu, { type ActionMenuItemProps } from '../ActionMenu'
-import { isContainRenderableCode, MessageArtifact } from '../Artifact'
 import { AssistantAvatar, SystemAvatar, UserAvatar } from '../common/Avatar'
 import { ScalableIcon } from '../common/ScalableIcon'
 import Loading from '../icons/Loading'
-import { ReasoningContentUI, ToolCallPartUI, WebSearchGroupUI } from '../message-parts/ToolCallPartUI'
+import {
+  DownloadArtifactsUI,
+  ReasoningContentUI,
+  StepTimelineUI,
+  ToolCallPartUI,
+} from '../message-parts/ToolCallPartUI'
 import { MessageAttachmentGrid } from './MessageAttachmentGrid'
 import MessageErrTips from './MessageErrTips'
-import MessageStatuses from './MessageLoading'
+import MessageStatuses, { PreparingToolCallStatus } from './MessageLoading'
+import {
+  getMessageActionVisibilityClass,
+  type MessageButtonGroup,
+  shouldShowConcurrentReplyStop,
+} from './message-action-state'
+import { isMessageReminderPresentation, resolveMessageErrorPresentation } from './message-error-presentation'
+import { shouldRightAlignMessage } from './message-layout'
+import { getMessageRoleClass } from './message-role-class'
+import { createMessageTimelineLayout } from './message-timeline'
+import { getMessageTokenDisplay } from './message-token-display'
+import { PictureGallery } from './PictureGallery'
+
+// Reset an assistant message back to a clean generating state, reusing the same
+// message slot (e.g. when acting on an agent-mode suggestion callout).
+function resetMessageForAgentModeResponse(msg: Message): Message {
+  return {
+    ...msg,
+    generating: true,
+    cancel: undefined,
+    contentParts: [],
+    errorCode: undefined,
+    error: undefined,
+    errorExtra: undefined,
+    status: [],
+    finishReason: undefined,
+  }
+}
 
 interface Props {
   id?: string
@@ -60,10 +122,44 @@ interface Props {
   msg: Message
   className?: string
   collapseThreshold?: number // 文本长度阀值, 超过这个长度则会被折叠
-  buttonGroup?: 'auto' | 'always' | 'none' // 按钮组显示策略, auto: 只在 hover 时显示; always: 总是显示; none: 不显示
+  buttonGroup?: MessageButtonGroup // 按钮组显示策略, auto: 只在 hover 时显示; always: 总是显示; none: 不显示
+  generatingReplyCount?: number
+  generationLocked?: boolean
+  readOnly?: boolean
+  allowGeneratingStop?: boolean
   small?: boolean
   assistantAvatarKey?: string
   sessionPicUrl?: string
+}
+
+const BackgroundTaskNotificationUI: FC<{ task: MessageBackgroundTask; className?: string }> = ({ task, className }) => {
+  const { t } = useTranslation()
+  const failed = task.status === 'failed'
+  return (
+    <Box className={cn('w-full px-2 py-1.5', className)} role="status">
+      <Flex justify="center">
+        <Flex
+          align="center"
+          gap={6}
+          px="sm"
+          py={5}
+          className="max-w-full rounded-full bg-chatbox-background-gray-secondary"
+        >
+          <ScalableIcon
+            icon={failed ? IconInfoCircle : IconPhotoPlus}
+            size={14}
+            className={failed ? 'text-chatbox-tint-error' : 'text-chatbox-tint-success'}
+          />
+          <Text size="xs" c={failed ? 'chatbox-error' : 'chatbox-secondary'} fw={500} truncate="end">
+            {failed ? t('Image generation failed') : t('Image generated')}
+          </Text>
+          <Text size="xs" c="chatbox-tertiary" className="shrink-0 tabular-nums">
+            · {t('Waited {{time}}', { time: formatElapsedTime(task.elapsedMs) })}
+          </Text>
+        </Flex>
+      </Flex>
+    </Box>
+  )
 }
 
 const _Message: FC<Props> = (props) => {
@@ -73,6 +169,10 @@ const _Message: FC<Props> = (props) => {
     className,
     collapseThreshold,
     buttonGroup = 'auto',
+    generatingReplyCount = 0,
+    generationLocked = false,
+    readOnly = false,
+    allowGeneratingStop = false,
     small,
     assistantAvatarKey,
     sessionPicUrl,
@@ -81,27 +181,21 @@ const _Message: FC<Props> = (props) => {
   const { t } = useTranslation()
   const theme = useTheme()
   const isSmallScreen = useIsSmallScreen()
-  const {
-    userAvatarKey,
-    showMessageTimestamp,
-    showModelName,
-    showTokenCount,
-    showWordCount,
-    showTokenUsed,
-    showFirstTokenLatency,
-    enableMarkdownRendering,
-    enableLaTeXRendering,
-    enableMermaidRendering,
-    autoPreviewArtifacts,
-    autoCollapseCodeBlock,
-    showAvatar,
-    messageLayout,
-  } = useSettingsStore((state) => state)
+  const userAvatarKey = useSettingsStore((state) => state.userAvatarKey)
+  const showMessageTimestamp = useSettingsStore((state) => state.showMessageTimestamp)
+  const showModelName = useSettingsStore((state) => state.showModelName)
+  const showWordCount = useSettingsStore((state) => state.showWordCount)
+  const showTokenUsed = useSettingsStore((state) => state.showTokenUsed)
+  const showFirstTokenLatency = useSettingsStore((state) => state.showFirstTokenLatency)
+  const enableMarkdownRendering = useSettingsStore((state) => state.enableMarkdownRendering)
+  const enableLaTeXRendering = useSettingsStore((state) => state.enableLaTeXRendering)
+  const enableMermaidRendering = useSettingsStore((state) => state.enableMermaidRendering)
+  const showAvatar = useSettingsStore((state) => state.showAvatar)
+  const messageLayout = useSettingsStore((state) => state.messageLayout)
 
   const isBubbleLayout = messageLayout === 'bubble'
 
-  const [previewArtifact, setPreviewArtifact] = useState(autoPreviewArtifacts)
-  const [shouldThrowError, setShouldThrowError] = useState(false)
+  const [retryChoiceOpened, setRetryChoiceOpened] = useState(false)
 
   const contentLength = useMemo(() => {
     return getMessageText(msg).length
@@ -127,14 +221,143 @@ const _Message: FC<Props> = (props) => {
     setQuote(input)
   }, [msg, setQuote])
 
-  const handleStop = useCallback(() => {
-    modifyMessage(sessionId, { ...msg, generating: false }, true)
+  const handleStop = useCallback(async () => {
+    if (msg.generating) {
+      await stopGeneratingMessages(sessionId, [msg], {
+        removeMessage,
+        persistMessage: (currentSessionId, message) => modifyMessage(currentSessionId, message, true),
+      })
+      return
+    }
+    await modifyMessage(sessionId, { ...msg, generating: false, cancel: undefined }, true)
   }, [sessionId, msg])
 
-  const handleRefresh = useCallback(() => {
-    handleStop()
-    regenerateInNewFork(sessionId, msg)
-  }, [handleStop, sessionId, msg])
+  const notifyGenerationLocked = useCallback(() => {
+    toastActions.add(t('Wait for the current replies to finish'), 2500)
+  }, [t])
+
+  const handleRefresh = useCallback(async () => {
+    if (generationLocked) {
+      notifyGenerationLocked()
+      return
+    }
+    await handleStop()
+    await regenerateInNewFork(sessionId, msg)
+  }, [generationLocked, handleStop, msg, notifyGenerationLocked, sessionId])
+
+  // Tracking is best-effort and must never block or break the accept/decline
+  // action, so this fetches the session on its own and swallows failures.
+  const trackAgentModeSuggestionActionAsync = useCallback(
+    (action: 'accept' | 'decline') => {
+      void getSession(sessionId)
+        .then((session) => {
+          let fileCount = 0
+          const location = session ? findMessageLocation(session, msg.id) : null
+          if (location) {
+            for (let index = location.index - 1; index >= 0; index -= 1) {
+              const message = location.list[index]
+              if (message.role === 'user') {
+                fileCount = message.files?.length ?? 0
+                break
+              }
+            }
+          }
+          trackAgentModeSuggestionAction({
+            action,
+            hasFiles: fileCount > 0,
+            fileCount,
+            context: {
+              sessionId,
+              mode: action === 'accept' ? 'work_mode' : 'chat_mode',
+              provider: session?.settings?.provider,
+              model: session?.settings?.modelId,
+            },
+          })
+        })
+        .catch(() => {})
+    },
+    [msg.id, sessionId]
+  )
+
+  const agentModeSuggestionHandledRef = useRef(false)
+
+  const handleStartAgentModeResponse = useCallback(async () => {
+    if (agentModeSuggestionHandledRef.current) return
+    agentModeSuggestionHandledRef.current = true
+    trackAgentModeSuggestionActionAsync('accept')
+    try {
+      await lockSessionAgentMode(sessionId, 'message_sent')
+      const nextMsg = resetMessageForAgentModeResponse(msg)
+      await modifyMessage(sessionId, nextMsg, true)
+      await generate(sessionId, nextMsg, { operationType: 'send_message', agentModeEntrySource: 'suggestion_accept' })
+    } catch (error) {
+      agentModeSuggestionHandledRef.current = false
+      throw error
+    }
+  }, [trackAgentModeSuggestionActionAsync, msg, sessionId])
+
+  const handleContinueNormalResponse = useCallback(async () => {
+    if (agentModeSuggestionHandledRef.current) return
+    agentModeSuggestionHandledRef.current = true
+    trackAgentModeSuggestionActionAsync('decline')
+    try {
+      await setSessionAgentMode(sessionId, 'off')
+      const nextMsg = resetMessageForAgentModeResponse(msg)
+      await modifyMessage(sessionId, nextMsg, true)
+      await generate(sessionId, nextMsg, { operationType: 'send_message', skipAgentModeSuggestion: true })
+    } catch (error) {
+      agentModeSuggestionHandledRef.current = false
+      throw error
+    }
+  }, [trackAgentModeSuggestionActionAsync, msg, sessionId])
+
+  const lastStepForRetry = useMemo(() => {
+    for (let index = msg.contentParts.length - 1; index >= 0; index -= 1) {
+      const part = msg.contentParts[index]
+      if (part.type === 'tool-call') {
+        const toolCallPart = part as MessageToolCallPart
+        if (isRetryableToolCallStep(toolCallPart)) {
+          return toolCallPart
+        }
+      }
+    }
+    return undefined
+  }, [msg.contentParts])
+
+  const handleRetryWholeMessage = useCallback(async () => {
+    setRetryChoiceOpened(false)
+    await handleRefresh()
+  }, [handleRefresh])
+
+  const handleRetryLastStep = useCallback(async () => {
+    if (!lastStepForRetry) return
+    if (generationLocked) {
+      notifyGenerationLocked()
+      return
+    }
+    setRetryChoiceOpened(false)
+    await retryFromLastToolCallAfterApiError(sessionId, msg.id, lastStepForRetry.toolCallId)
+  }, [generationLocked, lastStepForRetry, msg.id, notifyGenerationLocked, sessionId])
+
+  const handleErrorTipRetry = useCallback(async () => {
+    if (lastStepForRetry) {
+      if (generationLocked) {
+        notifyGenerationLocked()
+        return
+      }
+      await retryFromLastToolCallAfterApiError(sessionId, msg.id, lastStepForRetry.toolCallId)
+      return
+    }
+    await handleRefresh()
+  }, [generationLocked, handleRefresh, lastStepForRetry, msg.id, notifyGenerationLocked, sessionId])
+
+  const handleMessageRetry = useCallback(async () => {
+    if (lastStepForRetry) {
+      setRetryChoiceOpened(true)
+      return
+    }
+    await handleRefresh()
+  }, [handleRefresh, lastStepForRetry])
 
   const onGenerateMore = useCallback(() => {
     generateMore(sessionId, msg.id)
@@ -160,26 +383,31 @@ const _Message: FC<Props> = (props) => {
     await NiceModal.show('report-content', { contentId: getMessageText(msg) || msg.id })
   }, [msg])
 
-  const onDelMsg = useCallback(() => {
-    removeMessage(sessionId, msg.id)
-  }, [msg.id, sessionId])
+  const onDelMsg = useCallback(async () => {
+    // Deleting a still-streaming reply must stop it first: the stream writes by
+    // message id and would keep running invisibly after the message is gone.
+    if (msg.generating) {
+      await handleStop()
+    }
+    await removeMessage(sessionId, msg.id)
+  }, [handleStop, msg, sessionId])
 
   const onEditClick = useCallback(async () => {
-    await NiceModal.show('message-edit', { sessionId, msg: msg })
-  }, [msg, sessionId])
-
-  // for testing: manual trigger error
-  const onTriggerError = useCallback(() => {
-    setShouldThrowError(true)
-  }, [])
+    // The UI hides the edit entry for a streaming message, but guard anyway:
+    // saving a snapshot of it would be silently overwritten by the next chunk.
+    if (msg.generating) {
+      notifyGenerationLocked()
+      return
+    }
+    // Plain saves are safe while replies stream (writes are serialized and the
+    // in-flight context was snapshotted at generation start), but Save & Resend
+    // is a regenerate-class action and stays locked like Retry.
+    await NiceModal.show('message-edit', { sessionId, msg, hideSaveAndResend: generationLocked })
+  }, [generationLocked, msg, notifyGenerationLocked, sessionId])
 
   const onViewMessageJson = useCallback(async () => {
     await NiceModal.show('json-viewer', { title: t('Message Raw JSON'), data: msg })
   }, [msg, t])
-
-  if (shouldThrowError) {
-    throw new Error('Manual error triggered from Message component for testing ErrorBoundary')
-  }
 
   // Units like "tokens", "words", "tkn", "s" are intentionally kept as hardcoded English
   // because they are technical/universal abbreviations that remain readable across all locales.
@@ -189,8 +417,13 @@ const _Message: FC<Props> = (props) => {
       tips.push({ label: props.msg.model || 'unknown', tooltip: t('Model') as string })
     }
     if (showTokenUsed && msg.role === 'assistant' && !msg.generating) {
-      const tokens = msg.usage?.totalTokens ? msg.usage.totalTokens : msg.tokensUsed
-      if (tokens) tips.push({ label: `${tokens} tokens`, tooltip: t('Total tokens consumed') as string })
+      const consumedTokens = getMessageTokenDisplay(msg)
+      if (consumedTokens) {
+        tips.push({
+          label: `${consumedTokens} tokens`,
+          tooltip: t('Total tokens consumed') as string,
+        })
+      }
     }
     if (showWordCount && !msg.generating) {
       const wc = msg.wordCount !== undefined ? msg.wordCount : countWord(getMessageText(msg))
@@ -203,9 +436,6 @@ const _Message: FC<Props> = (props) => {
           tooltip: t('First token latency') as string,
         })
     }
-    // if (showTokenCount && !msg.generating) {
-    //   if (msg.tokenCount) tips.push({ label: `${msg.tokenCount} tkn`, tooltip: t('Token count') as string })
-    // }
   } else if (props.sessionType === 'picture') {
     if (showModelName && props.msg.role === 'assistant') {
       tips.push({ label: props.msg.model || 'unknown', tooltip: t('Model') as string })
@@ -230,14 +460,6 @@ const _Message: FC<Props> = (props) => {
     tips.push({ label: messageTimestamp })
   }
 
-  // 是否需要渲染 Aritfact 组件
-  const needArtifact = useMemo(() => {
-    if (msg.role !== 'assistant') {
-      return false
-    }
-    return isContainRenderableCode(getMessageText(msg))
-  }, [msg.contentParts, msg.role, msg])
-
   const trackWithSessionName = useCallback(
     async (event: string) => {
       const session = await getSession(sessionId).catch(() => null)
@@ -256,23 +478,112 @@ const _Message: FC<Props> = (props) => {
   }, [trackWithSessionName])
 
   const contentParts = msg.contentParts || []
+  const leadingStatuses = useMemo(
+    () => msg.status?.filter((status) => status.type !== 'preparing_tool_call'),
+    [msg.status]
+  )
+  const preparingToolCallStatuses = useMemo(
+    () => msg.status?.filter((status) => status.type === 'preparing_tool_call'),
+    [msg.status]
+  )
+  const downloadArtifactParts = useMemo(
+    () =>
+      contentParts.filter(
+        (item): item is MessageToolCallPart =>
+          item.type === 'tool-call' && (item as MessageToolCallPart).toolName === 'create_download'
+      ),
+    [contentParts]
+  )
 
-  const groupedContentParts = useMemo(() => {
-    const groups: Array<{ type: 'web_search_group'; parts: MessageToolCallPart[] } | (typeof contentParts)[number]> = []
-    for (const item of contentParts) {
-      if (item.type === 'tool-call' && (item as MessageToolCallPart).toolName === 'web_search') {
-        const last = groups[groups.length - 1]
-        if (last && 'parts' in last && last.type === 'web_search_group') {
-          last.parts.push(item as MessageToolCallPart)
-        } else {
-          groups.push({ type: 'web_search_group', parts: [item as MessageToolCallPart] })
-        }
-      } else {
-        groups.push(item)
+  // Normalize provider-specific non-streaming reasoning order before deciding
+  // which text belongs to the process timeline and which text is the final answer.
+  const { orderedContentParts, lastStepIndex, groupedContentParts } = useMemo(
+    () => createMessageTimelineLayout(contentParts, msg.isStreamingMode),
+    [contentParts, msg.isStreamingMode]
+  )
+
+  // Total time the assistant spent "working" on this message (thinking + tools).
+  // Prefer the wall-clock generation time, but never report less than the sum of
+  // the individual step durations (covers resumed/appended runs).
+  const workDurationMs = useMemo(() => {
+    let sum = 0
+    for (const part of contentParts) {
+      if ((part.type === 'reasoning' || part.type === 'tool-call') && part.duration) {
+        sum += part.duration
       }
     }
-    return groups
-  }, [contentParts])
+    return Math.max(msg.generationDuration ?? 0, sum)
+  }, [contentParts, msg.generationDuration])
+
+  const workStepCount = useMemo(
+    () => contentParts.filter((p) => p.type === 'reasoning' || p.type === 'tool-call').length,
+    [contentParts]
+  )
+
+  // There is something to fold when a thinking/tool step exists before the last
+  // content part (so collapsing hides the process and keeps the final answer).
+  const hasFoldableProcess = useMemo(
+    () =>
+      contentParts.some((p, i) => (p.type === 'reasoning' || p.type === 'tool-call') && i < contentParts.length - 1),
+    [contentParts]
+  )
+
+  // Offer the collapsible process summary on any finished assistant run that has
+  // a multi-step process worth hiding. With a single step there is nothing to fold —
+  // the step renders its own duration inline — so skip the collapse header entirely.
+  const showWorkSummary = msg.role === 'assistant' && !msg.generating && hasFoldableProcess && workStepCount > 1
+  const workSummaryLabel =
+    workDurationMs >= 1000
+      ? t('Worked for {{time}}', { time: formatElapsedTime(workDurationMs) })
+      : t('{{count}} steps', { count: workStepCount })
+  const [processCollapsed, setProcessCollapsed] = useState(false)
+
+  // When collapsed, hide the process and show the final answer. The answer can
+  // span multiple parts after the last step (e.g. text + image), so show the
+  // whole answer region rather than only the last part.
+  const displayGroups = useMemo<typeof groupedContentParts>(() => {
+    if (!(showWorkSummary && processCollapsed)) return groupedContentParts
+    const answerParts = orderedContentParts.slice(lastStepIndex + 1)
+    if (answerParts.length > 0) return answerParts
+    // The message ended on a process step — fall back to showing that last step.
+    const lastPart = orderedContentParts[orderedContentParts.length - 1]
+    if (!lastPart) return []
+    if (lastPart.type === 'tool-call' || lastPart.type === 'reasoning') {
+      return [{ type: 'step_group' as const, parts: [lastPart] }]
+    }
+    return [lastPart]
+  }, [showWorkSummary, processCollapsed, groupedContentParts, orderedContentParts, lastStepIndex])
+
+  // Renders an intermediate text block inside the step timeline, reusing the same
+  // markdown settings as the main answer text.
+  const renderTimelineText = useCallback(
+    (part: MessageTextPart, index: number): React.ReactNode =>
+      enableMarkdownRendering ? (
+        <Markdown
+          uniqueId={`${msg.id}-step-${index}`}
+          sessionId={sessionId}
+          enableLaTeXRendering={enableLaTeXRendering}
+          enableMermaidRendering={enableMermaidRendering}
+          generating={msg.generating}
+          onCodeCopy={onCodeCopy}
+          onPreviewWebpage={onPreviewWebpage}
+        >
+          {part.text || ''}
+        </Markdown>
+      ) : (
+        <div className="break-words [overflow-wrap:anywhere] whitespace-pre-line">{part.text}</div>
+      ),
+    [
+      enableMarkdownRendering,
+      enableLaTeXRendering,
+      enableMermaidRendering,
+      msg.generating,
+      msg.id,
+      onCodeCopy,
+      onPreviewWebpage,
+      sessionId,
+    ]
+  )
 
   const CollapseButton = (
     <span
@@ -299,22 +610,27 @@ const _Message: FC<Props> = (props) => {
               msg.role === 'assistant' && {
                 text: t('Reply Again'),
                 icon: IconReload,
+                testId: TestId.message.actionMenuRetry,
                 onClick: handleRefresh,
+                disabled: generationLocked && !isSmallScreen,
               },
             msg.role !== 'assistant' && {
               text: t('Reply Again Below'),
               icon: IconArrowDown,
+              testId: TestId.message.actionMenuRetryBelow,
               onClick: onGenerateMore,
             },
             !msg.model?.startsWith('Chatbox-AI') &&
               !(msg.role === 'assistant' && props.sessionType === 'picture') && {
                 text: t('Edit'),
                 icon: IconPencil,
+                testId: TestId.message.actionMenuEdit,
                 onClick: onEditClick,
               },
             !(props.sessionType === 'picture' && msg.role === 'assistant') && {
               text: t('copy'),
               icon: IconCopy,
+              testId: TestId.message.actionMenuCopy,
               onClick: onCopyMsg,
             },
             !msg.generating &&
@@ -329,10 +645,11 @@ const _Message: FC<Props> = (props) => {
       {
         text: t('Quote'),
         icon: IconQuoteFilled,
+        testId: TestId.message.actionQuote,
         onClick: quoteMsg,
       },
       { divider: true },
-      ...(msg.role === 'assistant' && platform.type === 'mobile'
+      ...(msg.role === 'assistant'
         ? [
             {
               text: t('report'),
@@ -341,14 +658,8 @@ const _Message: FC<Props> = (props) => {
             },
           ]
         : []),
-      // 开发环境添加测试错误按钮
       ...(process.env.NODE_ENV === 'development'
         ? [
-            // {
-            //   text: 'Trigger Error (Test)',
-            //   icon: IconBug,
-            //   onClick: onTriggerError,
-            // },
             {
               text: t('View Message JSON'),
               icon: IconCode,
@@ -360,6 +671,9 @@ const _Message: FC<Props> = (props) => {
         doubleCheck: true,
         text: t('delete'),
         icon: IconTrash,
+        testId: TestId.message.actionDelete,
+        confirmTestId: TestId.message.actionDeleteConfirm,
+        confirmPanelTestId: TestId.message.deleteConfirmation,
         onClick: onDelMsg,
       },
     ],
@@ -378,27 +692,48 @@ const _Message: FC<Props> = (props) => {
       onCopyMsg,
       msg.model,
       props.sessionType,
+      generationLocked,
     ]
   )
   const [actionMenuOpened, setActionMenuOpened] = useState(false)
 
   const isUserBubble = isBubbleLayout && msg.role === 'user'
-  const statusElements = <MessageStatuses statuses={msg.status} />
+  const isErrorReminder = msg.error ? isMessageReminderPresentation(resolveMessageErrorPresentation(msg)) : false
+  const isClassicLayout = !isBubbleLayout
+  const isClassicMessage = isClassicLayout && (msg.role === 'assistant' || msg.role === 'user')
+  const isRightAlignedMessage = shouldRightAlignMessage(messageLayout, msg.role)
+  const messageRoleClass = getMessageRoleClass(msg.role)
+  const shouldShowAvatar = showAvatar ?? true
+  const statusElements = <MessageStatuses statuses={leadingStatuses} />
+  const errorTipsElement = (
+    <MessageErrTips
+      msg={msg}
+      sessionId={sessionId}
+      onRetry={!readOnly && msg.role === 'assistant' ? handleErrorTipRetry : undefined}
+      isBubbleLayout={isBubbleLayout}
+    />
+  )
 
   const messageContent = (
     <>
-      {!isBubbleLayout && statusElements}
       <div
+        data-testid={TestId.message.content}
         className={cn(
-          isBubbleLayout ? 'inline-block max-w-full' : msg.role === 'assistant' ? 'w-full' : 'inline-block',
+          isBubbleLayout
+            ? 'inline-block max-w-full min-w-0'
+            : msg.role === 'assistant'
+              ? 'w-full min-w-0'
+              : 'inline-block max-w-full min-w-0',
           isBubbleLayout
             ? cn(
-                'px-4 py-1 rounded-2xl',
+                'px-4 py-1 rounded-lg',
                 msg.role === 'user'
                   ? 'bg-[var(--mantine-color-chatbox-brand-filled)] text-white'
                   : msg.role === 'assistant'
                     ? msg.error
-                      ? 'bg-chatbox-background-error-secondary border border-solid border-chatbox-border-error'
+                      ? isErrorReminder
+                        ? '!p-0 !bg-transparent'
+                        : 'bg-chatbox-background-error-secondary border border-solid border-chatbox-border-error'
                       : 'bg-chatbox-background-secondary'
                     : 'bg-chatbox-background-secondary rounded-lg'
               )
@@ -407,19 +742,39 @@ const _Message: FC<Props> = (props) => {
               : ''
         )}
       >
-        {isBubbleLayout && statusElements}
         <Box
           className={cn('msg-content', { 'msg-content-small': small })}
           sx={small ? { fontSize: theme.typography.body2.fontSize } : {}}
         >
-          {msg.reasoningContent && <ReasoningContentUI message={msg} onCopyReasoningContent={onCopyReasoningContent} />}
+          {showWorkSummary && (
+            <Flex
+              align="center"
+              gap={4}
+              className="cursor-pointer w-fit mb-1 select-none opacity-80 hover:opacity-100 transition-opacity"
+              onClick={() => setProcessCollapsed((v) => !v)}
+            >
+              <ScalableIcon icon={IconClockHour3} size={13} className="flex-none text-chatbox-tint-tertiary" />
+              <Text size="xs" c="chatbox-tertiary">
+                {workSummaryLabel}
+              </Text>
+              <ScalableIcon
+                icon={IconChevronDown}
+                size={13}
+                className={cn(
+                  'flex-none text-chatbox-tint-tertiary transition-transform',
+                  processCollapsed ? '' : 'rotate-180'
+                )}
+              />
+            </Flex>
+          )}
+          {msg.reasoningContent && !(showWorkSummary && processCollapsed) && (
+            <ReasoningContentUI message={msg} onCopyReasoningContent={onCopyReasoningContent} />
+          )}
           {getMessageText(msg, true, true).trim() === '' && <p></p>}
-          {groupedContentParts.length > 0 && (
+          {displayGroups.length > 0 && (
             <div>
-              {groupedContentParts.map((item, index) =>
-                'parts' in item && item.type === 'web_search_group' ? (
-                  <WebSearchGroupUI key={`web-search-group-${msg.id}-${index}`} parts={item.parts} />
-                ) : item.type === 'reasoning' ? (
+              {displayGroups.map((item, index) =>
+                item.type === 'reasoning' ? (
                   <div key={`reasoning-${msg.id}-${index}`}>
                     <ReasoningContentUI message={msg} part={item} onCopyReasoningContent={onCopyReasoningContent} />
                   </div>
@@ -428,6 +783,7 @@ const _Message: FC<Props> = (props) => {
                     {enableMarkdownRendering && !isCollapsed ? (
                       <Markdown
                         uniqueId={`${msg.id}-${index}`}
+                        sessionId={sessionId}
                         enableLaTeXRendering={enableLaTeXRendering}
                         enableMermaidRendering={enableMermaidRendering}
                         generating={msg.generating}
@@ -437,10 +793,14 @@ const _Message: FC<Props> = (props) => {
                         {item.text || ''}
                       </Markdown>
                     ) : (
-                      <div className="break-words [overflow-wrap:anywhere] whitespace-pre-line">
-                        {needCollapse && isCollapsed ? `${item.text.slice(0, collapseThreshold)}...` : item.text}
+                      <StreamingTextFade
+                        text={needCollapse && isCollapsed ? `${item.text.slice(0, collapseThreshold)}...` : item.text}
+                        streamKey={`${msg.id}-${index}`}
+                        generating={msg.role === 'assistant' && msg.generating === true}
+                        className="break-words [overflow-wrap:anywhere] whitespace-pre-line"
+                      >
                         {needCollapse && isCollapsed && CollapseButton}
-                      </div>
+                      </StreamingTextFade>
                     )}
                   </div>
                 ) : item.type === 'info' ? (
@@ -457,6 +817,58 @@ const _Message: FC<Props> = (props) => {
                       </Text>
                     </Flex>
                   </Flex>
+                ) : item.type === 'agent-mode-suggestion' ? (
+                  <Flex key={`agent-mode-suggestion-${msg.id}-${index}`} className="mb-2 w-full">
+                    <Flex
+                      className="w-full max-w-[760px] bg-chatbox-background-secondary border border-solid border-chatbox-border-primary rounded-lg shadow-sm overflow-hidden"
+                      align="stretch"
+                    >
+                      <div className="w-1 bg-chatbox-tint-brand" />
+                      <Flex
+                        align="center"
+                        gap="sm"
+                        px="sm"
+                        py="sm"
+                        className="min-w-0 flex-1"
+                        wrap={{ base: 'wrap', sm: 'nowrap' }}
+                      >
+                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-chatbox-background-brand-secondary text-chatbox-tint-brand">
+                          <ScalableIcon icon={IconRobot} size={18} />
+                        </div>
+                        <Stack gap={2} className="min-w-0 flex-1">
+                          <Text size="sm" fw={600} c="chatbox-primary">
+                            {t('Work Mode suggested')}
+                          </Text>
+                          {item.reason && (
+                            <Text size="xs" c="chatbox-secondary" className="break-words [overflow-wrap:anywhere]">
+                              {item.reason}
+                            </Text>
+                          )}
+                        </Stack>
+                        <Flex gap="xs" className="shrink-0" wrap="nowrap">
+                          <Button
+                            size="xs"
+                            variant="subtle"
+                            color="gray"
+                            className="shrink-0"
+                            onClick={handleContinueNormalResponse}
+                          >
+                            {t('Continue in Chat Mode')}
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="light"
+                            color="chatbox-brand"
+                            className="shrink-0"
+                            leftSection={<IconRobot size={14} />}
+                            onClick={handleStartAgentModeResponse}
+                          >
+                            {t('Use Work Mode')}
+                          </Button>
+                        </Flex>
+                      </Flex>
+                    </Flex>
+                  </Flex>
                 ) : item.type === 'image' ? (
                   props.sessionType !== 'picture' && (
                     <div key={`image-${item.storageKey}`} className="my-2">
@@ -467,7 +879,7 @@ const _Message: FC<Props> = (props) => {
                       />
                       {item.ocrResult && (
                         <div
-                          className="my-2 p-2 rounded-md cursor-pointer transition-colors"
+                          className="my-2 p-2 rounded-lg cursor-pointer transition-colors"
                           onClick={async (e) => {
                             e.stopPropagation()
                             await NiceModal.show('content-viewer', {
@@ -503,35 +915,82 @@ const _Message: FC<Props> = (props) => {
                       )}
                     </div>
                   )
+                ) : 'parts' in item && item.type === 'step_group' ? (
+                  item.parts.some((p) => p.type !== 'reasoning') ? (
+                    <StepTimelineUI
+                      key={`step-group-${msg.id}-${index}`}
+                      parts={item.parts}
+                      message={msg}
+                      sessionId={sessionId}
+                      messageId={msg.id}
+                      onCopyReasoningContent={onCopyReasoningContent}
+                      renderText={renderTimelineText}
+                    />
+                  ) : (
+                    <Fragment key={`reasoning-group-${msg.id}-${index}`}>
+                      {item.parts.map((p, pIdx) => (
+                        <ReasoningContentUI
+                          key={`reasoning-${msg.id}-${index}-${pIdx}`}
+                          message={msg}
+                          part={p as MessageReasoningPart}
+                          onCopyReasoningContent={onCopyReasoningContent}
+                        />
+                      ))}
+                    </Fragment>
+                  )
                 ) : item.type === 'tool-call' ? (
-                  <ToolCallPartUI key={item.toolCallId} part={item as MessageToolCallPart} />
+                  <ToolCallPartUI
+                    key={item.toolCallId}
+                    part={item as MessageToolCallPart}
+                    sessionId={sessionId}
+                    messageId={msg.id}
+                  />
                 ) : null
               )}
             </div>
           )}
+          {!msg.generating && (
+            <DownloadArtifactsUI parts={downloadArtifactParts} sessionId={sessionId} messageId={msg.id} />
+          )}
+          {preparingToolCallStatuses?.map((status) => (
+            <PreparingToolCallStatus key={`preparing-tool-call-${status.toolName ?? 'tool-call'}`} status={status} />
+          ))}
         </Box>
         {props.sessionType === 'picture' && contentParts.filter((p) => p.type === 'image').length > 0 && (
-          <PictureGallery
-            pictures={contentParts.filter((p) => p.type === 'image')}
-            onReport={platform.type === 'mobile' ? onReport : undefined}
-          />
+          <PictureGallery pictures={contentParts.filter((p) => p.type === 'image')} onReport={onReport} />
         )}
-        <MessageErrTips
-          msg={msg}
-          onRetry={msg.role === 'assistant' ? handleRefresh : undefined}
-          isBubbleLayout={isBubbleLayout}
-        />
+        {isBubbleLayout && errorTipsElement}
+        <Modal
+          opened={retryChoiceOpened}
+          onClose={() => setRetryChoiceOpened(false)}
+          title={t('Retry failed response')}
+          centered
+        >
+          <Stack gap="sm">
+            <Text size="sm" c="chatbox-secondary">
+              {t('The response failed after the last step. What would you like to retry?')}
+            </Text>
+            <Button color="chatbox-brand" onClick={handleRetryLastStep}>
+              {t('Retry from last step')}
+            </Button>
+            <Button variant="light" color="chatbox-brand" onClick={handleRetryWholeMessage}>
+              {t('Retry whole message')}
+            </Button>
+          </Stack>
+        </Modal>
         {needCollapse && !isCollapsed && CollapseButton}
         {msg.generating && contentParts.length === 0 && (
           <div
             className={cn(
               'inline-flex items-center gap-1.5 py-3',
-              isBubbleLayout ? 'px-1 rounded-2xl bg-chatbox-background-secondary' : 'px-4'
+              isBubbleLayout ? 'px-1 rounded-lg bg-chatbox-background-secondary' : 'px-4'
             )}
           >
             <Loading />
           </div>
         )}
+        {!isBubbleLayout && msg.error && <div className="mt-2">{errorTipsElement}</div>}
+        {leadingStatuses && leadingStatuses.length > 0 && <div className="mt-2">{statusElements}</div>}
       </div>
     </>
   )
@@ -554,49 +1013,100 @@ const _Message: FC<Props> = (props) => {
       )
     })
 
-  const actionButtons = buttonGroup !== 'none' && !msg.generating && (
+  const showConcurrentReplyStop = shouldShowConcurrentReplyStop({
+    allowStop: allowGeneratingStop,
+    cancellable: isCancellableGeneratingAssistantMessage(msg),
+    generatingReplyCount,
+    sessionType: props.sessionType,
+  })
+  const generatingActions = showConcurrentReplyStop && (
+    <Flex gap={0} m="4px -4px -4px -4px" align="center" className={isSmallScreen ? 'sticky bottom-4' : ''}>
+      <Flex
+        gap={0}
+        className={
+          isSmallScreen
+            ? 'p-xxs bg-chatbox-background-primary rounded-lg border-[0.5px] border-solid border-chatbox-border-primary shadow-sm'
+            : ''
+        }
+      >
+        <MessageActionIcon icon={IconPlayerStopFilled} tooltip={t('Stop generating this reply')} onClick={handleStop} />
+      </Flex>
+    </Flex>
+  )
+
+  const actionButtons = !readOnly && buttonGroup !== 'none' && !msg.generating && (
     <Flex
       gap={0}
       m="4px -4px -4px -4px"
       className={clsx(
-        'group-hover/message:opacity-100 opacity-0 transition-opacity',
-        actionMenuOpened || buttonGroup === 'always' ? 'opacity-100' : '',
+        'transition-opacity',
+        getMessageActionVisibilityClass(actionMenuOpened || buttonGroup === 'always'),
         isSmallScreen ? 'sticky bottom-4' : ''
       )}
       align="center"
     >
       <Flex
+        data-testid={TestId.message.actionBar}
         gap={0}
         className={
           isSmallScreen
-            ? 'p-xxs bg-chatbox-background-primary rounded-md border-[0.5px] border-solid border-chatbox-border-primary shadow-sm'
+            ? 'p-xxs bg-chatbox-background-primary rounded-lg border-[0.5px] border-solid border-chatbox-border-primary shadow-sm'
             : ''
         }
       >
         {!msg.generating && msg.role === 'assistant' && (
-          <MessageActionIcon icon={IconReload} tooltip={t('Reply Again')} onClick={handleRefresh} />
+          <MessageActionIcon
+            testId={TestId.message.actionBarRetry}
+            icon={IconReload}
+            tooltip={generationLocked ? t('Wait for the current replies to finish') : t('Reply Again')}
+            onClick={handleMessageRetry}
+            disabled={generationLocked && !isSmallScreen}
+          />
         )}
         {msg.role !== 'assistant' && (
-          <MessageActionIcon icon={IconArrowDown} tooltip={t('Reply Again Below')} onClick={onGenerateMore} />
+          <MessageActionIcon
+            testId={TestId.message.actionBarRetryBelow}
+            icon={IconArrowDown}
+            tooltip={t('Reply Again Below')}
+            onClick={onGenerateMore}
+          />
         )}
         {!msg.model?.startsWith('Chatbox-AI') && !(msg.role === 'assistant' && props.sessionType === 'picture') && (
-          <MessageActionIcon icon={IconPencil} tooltip={t('Edit')} onClick={onEditClick} />
+          <MessageActionIcon
+            testId={TestId.message.actionBarEdit}
+            icon={IconPencil}
+            tooltip={t('Edit')}
+            onClick={onEditClick}
+          />
         )}
         {!(props.sessionType === 'picture' && msg.role === 'assistant') && (
-          <MessageActionIcon icon={IconCopy} tooltip={t('Copy')} onClick={onCopyMsg} />
+          <MessageActionIcon
+            testId={TestId.message.actionBarCopy}
+            icon={IconCopy}
+            tooltip={t('Copy')}
+            onClick={onCopyMsg}
+          />
         )}
         {!msg.generating && props.sessionType === 'picture' && msg.role === 'assistant' && (
           <MessageActionIcon icon={IconPhotoPlus} tooltip={t('Generate More Images Below')} onClick={onGenerateMore} />
         )}
         <ActionMenu
           items={actionMenuItems}
+          contentTestId={TestId.message.actionMenu}
           opened={actionMenuOpened}
           onChange={(opened) => setActionMenuOpened(opened)}
         >
-          <MessageActionIcon icon={IconDotsVertical} tooltip={t('More')} />
+          <MessageActionIcon testId={TestId.message.actionMore} icon={IconDotsVertical} tooltip={t('More')} />
         </ActionMenu>
       </Flex>
     </Flex>
+  )
+
+  const messageActions = (
+    <>
+      {actionButtons}
+      {generatingActions}
+    </>
   )
 
   const meta = (
@@ -605,14 +1115,14 @@ const _Message: FC<Props> = (props) => {
       gap={2}
       mt={isBubbleLayout ? 4 : 2}
       className={cn(isBubbleLayout ? 'px-1' : '')}
-      align={isUserBubble ? 'flex-end' : 'flex-start'}
+      align={isRightAlignedMessage ? 'flex-end' : 'flex-start'}
     >
       {tipsElements && (
         <Flex
           align="center"
           gap={4}
           wrap="wrap"
-          justify={isUserBubble ? 'flex-end' : 'flex-start'}
+          justify={isRightAlignedMessage ? 'flex-end' : 'flex-start'}
           className="overflow-hidden"
         >
           {tipsElements}
@@ -621,19 +1131,26 @@ const _Message: FC<Props> = (props) => {
     </Flex>
   )
 
+  if (msg.backgroundTask) {
+    return <BackgroundTaskNotificationUI task={msg.backgroundTask} className={className} />
+  }
+
   if (isBubbleLayout && msg.role === 'user') {
     return (
       <Box
+        data-testid={TestId.message.item}
+        data-message-role={msg.role}
         ref={ref}
         id={props.id}
         key={msg.id}
         className={cn(
           'group/message',
           'msg-block',
+          'bubble-msg',
           'bubble-user-msg',
           'px-2 py-1.5',
           msg.generating ? 'rendering' : 'render-done',
-          'user-msg',
+          messageRoleClass,
           className,
           'w-full'
         )}
@@ -645,14 +1162,21 @@ const _Message: FC<Props> = (props) => {
           },
         }}
       >
-        <Flex justify="flex-end" gap="xs" className="w-full">
-          <Flex direction="column" align="flex-end" className={cn('max-w-[85%]', isSmallScreen && 'max-w-[95%]')}>
+        <Flex justify="flex-end" gap="xs" className="w-full min-w-0">
+          <Flex
+            direction="column"
+            align="flex-end"
+            className={cn(
+              'min-w-0',
+              isSmallScreen ? (shouldShowAvatar ? 'max-w-[calc(100%-3rem)]' : 'max-w-[95%]') : 'max-w-[85%]'
+            )}
+          >
             {messageContent}
             {(msg.files || msg.links) && <MessageAttachmentGrid files={msg.files} links={msg.links} align="end" />}
             {meta}
             {actionButtons}
           </Flex>
-          {(showAvatar ?? true) && (
+          {shouldShowAvatar && (
             <Box className="mt-1 shrink-0">
               <UserAvatar avatarKey={userAvatarKey} onClick={() => navigateToSettings('/chat')} />
             </Box>
@@ -662,17 +1186,78 @@ const _Message: FC<Props> = (props) => {
     )
   }
 
+  if (isClassicMessage) {
+    return (
+      <Box
+        ref={ref}
+        id={props.id}
+        key={msg.id}
+        className={cn(
+          'group/message',
+          'msg-block',
+          'px-2 py-1.5',
+          msg.generating ? 'rendering' : 'render-done',
+          messageRoleClass,
+          className,
+          'w-full'
+        )}
+        sx={{
+          paddingBottom: '0.1rem',
+          paddingX: '1rem',
+          [theme.breakpoints.down('sm')]: {
+            paddingX: '0.3rem',
+          },
+        }}
+      >
+        <Flex gap="xs" align="flex-start" className="w-full min-w-0">
+          {shouldShowAvatar && (
+            <Box className={cn('relative shrink-0', msg.role !== 'assistant' ? 'mt-1' : 'mt-2')}>
+              {msg.role === 'assistant' ? (
+                <AssistantAvatar
+                  avatarKey={assistantAvatarKey}
+                  picUrl={sessionPicUrl}
+                  sessionType={props.sessionType}
+                  onClick={onClickAssistantAvatar}
+                />
+              ) : (
+                <UserAvatar avatarKey={userAvatarKey} onClick={() => navigateToSettings('/chat')} />
+              )}
+              {msg.role === 'assistant' && msg.generating && (
+                <Flex className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
+                  <Loader size={32} className=" " classNames={{ root: "after:content-[''] after:border-[2px]" }} />
+                </Flex>
+              )}
+            </Box>
+          )}
+          <Flex
+            direction="column"
+            align="flex-start"
+            className={cn('min-w-0 flex-1 max-w-full', isSmallScreen && 'max-w-[95%]')}
+          >
+            {messageContent}
+            {(msg.files || msg.links) && <MessageAttachmentGrid files={msg.files} links={msg.links} align="start" />}
+            {meta}
+            {messageActions}
+          </Flex>
+        </Flex>
+      </Box>
+    )
+  }
+
   return (
     <Box
+      data-testid={TestId.message.item}
+      data-message-role={msg.role}
       ref={ref}
       id={props.id}
       key={msg.id}
       className={cn(
         'group/message',
         'msg-block',
+        isBubbleLayout ? 'bubble-msg' : '',
         'px-2 py-1.5',
         msg.generating ? 'rendering' : 'render-done',
-        { user: 'user-msg', system: 'system-msg', assistant: 'assistant-msg', tool: 'tool-msg' }[msg.role || 'user'],
+        messageRoleClass,
         className,
         'w-full'
       )}
@@ -720,7 +1305,7 @@ const _Message: FC<Props> = (props) => {
               <MessageAttachmentGrid files={msg.files} links={msg.links} align={isUserBubble ? 'end' : 'start'} />
             )}
             {meta}
-            {actionButtons}
+            {messageActions}
           </Grid>
         </Grid>
       </Grid>
@@ -730,174 +1315,15 @@ const _Message: FC<Props> = (props) => {
 
 export default memo(_Message)
 
-function getBase64ImageSize(base64: string): Promise<{ width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    const cleanup = () => {
-      img.onload = null
-      img.onerror = null
-      try {
-        img.src = ''
-      } catch {
-        // ignore
-      }
-    }
-    img.onload = () => {
-      const size = { width: img.width, height: img.height }
-      cleanup()
-      resolve(size)
-    }
-    img.onerror = (err) => {
-      cleanup()
-      reject(err)
-    }
-    img.src = base64
-  })
-}
-
-type PictureGalleryProps = {
-  pictures: MessagePicture[]
-  compact?: boolean
-  onReport?(picture: MessagePicture): void
-}
-
-const PictureGallery = memo(({ pictures, compact, onReport }: PictureGalleryProps) => {
-  const isSmallScreen = useIsSmallScreen()
-  const imageHeight = compact ? (isSmallScreen ? 60 : 100) : isSmallScreen ? 100 : 200
-  const fetchBlob = useFetchBlob()
-  const uiElements: UIElementData[] = concat(
-    [
-      {
-        name: 'custom-download-button',
-        ariaLabel: 'Download',
-        order: 9,
-        isButton: true,
-        html: {
-          isCustomSVG: true,
-          inner:
-            '<path d="M20.5 14.3 17.1 18V10h-2.2v7.9l-3.4-3.6L10 16l6 6.1 6-6.1ZM23 23H9v2h14Z" id="pswp__icn-download"/>',
-          outlineID: 'pswp__icn-download',
-        },
-        appendTo: 'bar',
-        onClick: async (_e: MouseEvent, _el: HTMLElement, pswp: import('photoswipe').default) => {
-          const picture = pictures[pswp.currIndex]
-          if (picture.storageKey) {
-            const base64 = await fetchBlob(picture.storageKey)
-            if (!base64) {
-              return
-            }
-            // storageKey中含有冒号，会在android端导致存储失败，且android端在同文件名的情况下不会再次保存图片，也无提示，可能对用户造成困扰，所以增加随机后缀
-            const filename =
-              platform.type === 'mobile'
-                ? `${picture.storageKey.replaceAll(':', '_')}_${Math.random().toString(36).substring(7)}`
-                : picture.storageKey
-            platform.exporter.exportImageFile(filename, base64)
-          } else if (picture.url) {
-            platform.exporter.exportByUrl(`image_${Math.random().toString(36).substring(7)}`, picture.url)
-          }
-        },
-      },
-    ],
-    onReport
-      ? [
-          {
-            name: 'report-button',
-            ariaLabel: 'Report',
-            order: 8,
-            isButton: true,
-            html: {
-              isCustomSVG: true,
-              inner:
-                '<path d="M 16 6 A 10 10 0 0 1 16 26 L 16 24 A 8 8 0 0 0 16 8 L 16 6 A 10 10 0 0 0 16 26 L 16 24 A 8 8 0 0 1 16 8 M 15 11 A 1 1 0 0 1 17 11 L 17 16 A 1 1 0 0 1 15 16 M 16 19 A 1.5 1.5 0 0 1 16 22 A 1.5 1.5 0 0 1 16 19 Z" id="pswp__icn-report">',
-              outlineID: 'pswp__icn-report',
-            },
-            appendTo: 'bar',
-            onClick: (_e, _el, pswp) => {
-              const picture = pictures[pswp.currIndex]
-              pswp.close()
-              onReport(picture)
-            },
-          },
-        ]
-      : []
-  )
-  return (
-    <Flex gap="sm" wrap="wrap">
-      <Gallery uiElements={uiElements}>
-        {pictures.map((p) =>
-          p.storageKey ? (
-            <ImageInStorageGalleryItem key={p.storageKey} storageKey={p.storageKey} height={imageHeight} />
-          ) : p.url ? (
-            <GalleryItem key={p.url} original={p.url} thumbnail={p.url} width={1024} height={1024}>
-              {({ ref, open }) => (
-                <Img
-                  src={p.url}
-                  h={imageHeight}
-                  w="auto"
-                  fit="contain"
-                  radius="md"
-                  ref={ref}
-                  onClick={open}
-                  className="cursor-pointer"
-                />
-              )}
-            </GalleryItem>
-          ) : undefined
-        )}
-      </Gallery>
-    </Flex>
-  )
-})
-
-const ImageInStorageGalleryItem = ({ storageKey, height }: { storageKey: string; height?: number }) => {
-  const isSmallScreen = useIsSmallScreen()
-  const fallbackHeight = isSmallScreen ? 100 : 200
-  const fetchBlob = useFetchBlob()
-  const { data: pic } = useQuery({
-    queryKey: ['image-in-storage-gallery-item', storageKey],
-    queryFn: async ({ queryKey: [, key] }) => {
-      const blob = await fetchBlob(key as string)
-      if (!blob) {
-        return null
-      }
-      const base64 = blob.startsWith('data:image/') ? blob : `data:image/png;base64,${blob}`
-      const size = await getBase64ImageSize(base64)
-      return {
-        storageKey,
-        ...size,
-        data: base64,
-      }
-    },
-    staleTime: Infinity,
-    gcTime: 60 * 1000,
-  })
-
-  return pic ? (
-    <GalleryItem original={pic.data} thumbnail={pic.data} width={pic.width} height={pic.height}>
-      {({ ref, open }) => (
-        <Img
-          src={pic.data}
-          h={height ?? fallbackHeight}
-          w="auto"
-          fit="contain"
-          radius="md"
-          ref={ref}
-          onClick={open}
-          className="cursor-pointer"
-        />
-      )}
-    </GalleryItem>
-  ) : null
-}
-
 export const MessageActionIcon = forwardRef<
   HTMLButtonElement,
   ActionIconProps & {
     tooltip?: string | null
+    testId?: string
     onClick?: MouseEventHandler<HTMLButtonElement>
     icon: React.ElementType<IconProps>
   }
->(({ tooltip, icon, ...props }, ref) => {
+>(({ tooltip, icon, testId, ...props }, ref) => {
   const isSmallScreen = useIsSmallScreen()
   const actionIcon = (
     <ActionIcon
@@ -911,6 +1337,7 @@ export const MessageActionIcon = forwardRef<
       bd={0}
       color="chatbox-secondary"
       aria-label={tooltip ?? undefined}
+      data-testid={testId}
       {...props}
     >
       <ScalableIcon icon={icon} size={isSmallScreen ? 20 : 16} />

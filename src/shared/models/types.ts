@@ -1,7 +1,8 @@
-import type { ModelMessage, TextStreamPart, ToolSet } from 'ai'
+import type { ModelMessage, PrepareStepFunction, TextStreamPart, ToolSet } from 'ai'
 import {
   type MessageContentParts,
   type MessageStatus,
+  type ProviderModelInfo,
   type ProviderOptions,
   ProviderOptionsSchema,
   type StreamTextResult,
@@ -12,11 +13,21 @@ import { z } from 'zod'
 export interface ModelInterface {
   name: string
   modelId: string
+  /**
+   * Resolved API family of this model instance. getModel() stamps it from the provider
+   * type (builtin/custom providers) or the per-model remote config (ChatboxAI).
+   */
+  readonly apiStyle?: ProviderModelInfo['apiStyle']
   isSupportVision(): boolean
   isSupportToolUse(scope?: ToolUseScope): boolean
   isSupportSystemMessage(): boolean
   chat: (messages: ModelMessage[], options: CallChatCompletionOptions) => Promise<StreamTextResult>
   chatStream: (messages: ModelMessage[], options: ChatStreamOptions) => AsyncGenerator<ModelStreamPart>
+  /** Apply model-specific normalization after a streamed response has completed. */
+  normalizeCompletedResponse: (
+    contentParts: MessageContentParts,
+    finishReason: string | undefined
+  ) => MessageContentParts
   paint: (
     params: {
       prompt: string
@@ -31,6 +42,7 @@ export interface ModelInterface {
 
 export const CallChatCompletionOptionsSchema = z.object({
   sessionId: z.string().optional(),
+  agentMode: z.boolean().optional(),
   signal: z.instanceof(AbortSignal).optional(),
   onResultChange: z.custom<OnResultChange>().optional(),
   tools: z.custom<ToolSet>().optional(),
@@ -39,6 +51,8 @@ export const CallChatCompletionOptionsSchema = z.object({
 
 export interface CallChatCompletionOptions<Tools extends ToolSet = ToolSet> {
   sessionId?: string
+  /** Whether Agent/Work Mode capabilities are active for this request. */
+  agentMode?: boolean
   signal?: AbortSignal
   onResultChange?: OnResultChange
   onStatusChange?: OnStatusChange
@@ -63,10 +77,13 @@ export type OnStatusChange = (status: MessageStatus | null) => void
 // New types for chatStream() API
 export interface ChatStreamOptions {
   sessionId?: string
+  /** Whether Agent/Work Mode capabilities are active for this request. */
+  agentMode?: boolean
   signal?: AbortSignal
   tools?: ToolSet
   providerOptions?: ProviderOptions
   maxSteps?: number
+  prepareStep?: PrepareStepFunction<ToolSet>
 }
 
 export type ModelStatus = MessageStatus

@@ -1,18 +1,8 @@
 import NiceModal from '@ebay/nice-modal-react'
-import {
-  ActionIcon,
-  Box,
-  Button,
-  Flex,
-  Loader,
-  Menu,
-  Stack,
-  Text,
-  Textarea,
-  Tooltip,
-  UnstyledButton,
-} from '@mantine/core'
+import { autoUpdate, computePosition, flip, offset, shift, size } from '@floating-ui/dom'
+import { ActionIcon, Box, Button, Flex, Loader, Menu, Stack, Text, Textarea, UnstyledButton } from '@mantine/core'
 import { useViewportSize } from '@mantine/hooks'
+import { TestId } from '@shared/automation/testids'
 import {
   getFileAcceptConfig,
   getFileAcceptString,
@@ -20,8 +10,11 @@ import {
   isSupportedFile,
 } from '@shared/file-extensions'
 import { KNOWLEDGE_BASE_MAX_FILE_SIZE, KNOWLEDGE_BASE_MAX_FILE_SIZE_LABEL } from '@shared/knowledge-base'
+import { listPendingApprovalToolCalls } from '@shared/message-approval'
+import { isDeepSeekWeakToolUse } from '@shared/models/utils/deepseek'
 import { getModel } from '@shared/providers'
 import { formatNumber } from '@shared/utils'
+import { resolveReasoningProviderOptions } from '@shared/utils/reasoning-control'
 import {
   IconAdjustmentsHorizontal,
   IconAlertCircle,
@@ -31,28 +24,38 @@ import {
   IconCirclePlus,
   IconFilePencil,
   IconFolder,
-  IconHammer,
-  IconLink,
   IconPhoto,
   IconPlayerStopFilled,
   IconPlus,
   IconSettings,
-  IconVocabulary,
+  IconWand,
   IconWorldWww,
 } from '@tabler/icons-react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useAtom, useAtomValue } from 'jotai'
-import _, { pick } from 'lodash'
+import { pick } from 'lodash'
 import type React from 'react'
-import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
+import {
+  forwardRef,
+  memo,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import { createPortal } from 'react-dom'
 import { useDropzone } from 'react-dropzone'
 import { useTranslation } from 'react-i18next'
 import { v4 as uuidv4 } from 'uuid'
 import { createModelDependencies } from '@/adapters'
+import { JK_PAGE_NAMES } from '@/analytics/jk-events'
+import { AppTooltip as Tooltip } from '@/components/ui/tooltip'
 import useInputBoxHistory from '@/hooks/useInputBoxHistory'
 import { useKnowledgeBase } from '@/hooks/useKnowledgeBase'
-import { useMessageInput } from '@/hooks/useMessageInput'
 import { useProviders } from '@/hooks/useProviders'
 import { useSaveBlob } from '@/hooks/useSaveBlob'
 import { useIsSmallScreen } from '@/hooks/useScreenChange'
@@ -70,23 +73,26 @@ import {
   useModelRegistryVersion,
 } from '@/packages/model-registry'
 import * as picUtils from '@/packages/pic_utils'
+import { skillsController, subscribeSkillsChanged } from '@/packages/skills/controller'
 import platform from '@/platform'
 import { StorageKeyGenerator } from '@/storage/StoreStorage'
+import { notifyApprovalInputNudge } from '@/stores/approvalAttentionStore'
 import * as atoms from '@/stores/atoms'
 import { compactionUIStateMapAtom } from '@/stores/atoms/compactionAtoms'
 import * as chatStore from '@/stores/chatStore'
 import { useSession, useSessionSettings } from '@/stores/chatStore'
+import { useSessionAgentMode } from '@/stores/session/agent-mode'
 import { settingsStore, useSettingsStore } from '@/stores/settingsStore'
 import { useUIStore } from '@/stores/uiStore'
-import { delay } from '@/utils'
-import { featureFlags } from '@/utils/feature-flags'
 import { trackEvent } from '@/utils/track'
 import {
   type KnowledgeBase,
   type Message,
   ModelProviderEnum,
+  type ProviderModelInfo,
   type SessionAttachment,
   type SessionAttachmentIndexingStage,
+  type SessionSettings,
   type SessionType,
   type ShortcutSendValue,
 } from '../../../shared/types'
@@ -101,27 +107,23 @@ import { CompressionModal } from '../common/CompressionModal'
 import { ScalableIcon } from '../common/ScalableIcon'
 import Disclaimer from '../Disclaimer'
 import ProviderImageIcon from '../icons/ProviderImageIcon'
-import KnowledgeBaseMenu from '../knowledge-base/KnowledgeBaseMenu'
-import ModelSelector from '../ModelSelector'
-import MCPMenu from '../mcp/MCPMenu'
-import { FileMiniCard, ImageMiniCard, LinkMiniCard } from './Attachments'
+import ModelSelectorV2 from '../ModelSelectorV2'
+import AgentModeButton from './AgentModeButton'
+import { FileMiniCard, getParserTypeLabel, ImageMiniCard } from './Attachments'
+import { getAgentModeUIState } from './agentModeState'
 import { ImageUploadInput } from './ImageUploadInput'
-import {
-  cleanupFile,
-  cleanupLink,
-  markFileProcessing,
-  markLinkProcessing,
-  onFileProcessed,
-  onLinkProcessed,
-  storeFilePromise,
-  storeLinkPromise,
-} from './preprocessState'
+import { MessageInputField, type MessageInputFieldRef } from './MessageInputField'
+import { cleanupFile, markFileProcessing, onFileProcessed, storeFilePromise } from './preprocessState'
+import ReasoningControlButton from './ReasoningControlButton'
+import { getTrailingSkillCommand, insertSkillCommandText } from './skillCommand'
 import TokenCountMenu from './TokenCountMenu'
+import { useReasoningControlState } from './useReasoningControlState'
 
 export type InputBoxPayload = {
   constructedMessage: Message
   needGenerating?: boolean
   onUserMessageReady?: () => void
+  settingsPatch?: Partial<SessionSettings>
 }
 
 export type InputBoxRef = {
@@ -132,6 +134,8 @@ export type InputBoxProps = {
   sessionId?: string
   sessionType?: SessionType
   generating?: boolean
+  /** Number of active replies with a cancellation controller in this runtime. */
+  generatingCount?: number
   model?: {
     provider: string
     modelId: string
@@ -221,6 +225,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       sessionId,
       sessionType = 'chat',
       generating = false,
+      generatingCount = 0,
       model,
       fullWidth = false,
       onSelectModel,
@@ -280,6 +285,14 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
     const latestInputRef = useRef('')
     const [hasTextContent, setHasTextContent] = useState(false)
     const draftMessageIdRef = useRef<string | undefined>(undefined)
+    const enabledSkillNames = useSettingsStore((state) => state.skills.enabledSkillNames)
+    const [inputSkills, setInputSkills] = useState<Array<{ name: string; description: string }>>([])
+    const [inputSkillsLoading, setInputSkillsLoading] = useState(false)
+    const [skillCommandQuery, setSkillCommandQuery] = useState<string | null>(null)
+    const [skillCommandSelectedIndex, setSkillCommandSelectedIndex] = useState(0)
+    const skillCommandQueryRef = useRef<string | null>(null)
+    const skillMenuAnchorRef = useRef<HTMLDivElement | null>(null)
+    const skillMenuFloatingRef = useRef<HTMLDivElement | null>(null)
 
     const debouncedUpdateTimerRef = useRef<ReturnType<typeof setTimeout>>()
     const resetHistoryIndexRef = useRef<() => void>(() => {})
@@ -289,17 +302,86 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       resetHistoryIndexRef.current()
     }, [])
 
-    const onMessageInputValueChange = useCallback((value: string) => {
-      latestInputRef.current = value
-      const hasContent = value.trim().length > 0
-      setHasTextContent((prev) => {
-        if (prev === hasContent) return prev
-        return hasContent
-      })
-      // Schedule debounced pre-constructed message update
-      clearTimeout(debouncedUpdateTimerRef.current)
-      debouncedUpdateTimerRef.current = setTimeout(() => flushRef.current(), 300)
+    const updateSkillCommandQuery = useCallback((query: string | null) => {
+      if (skillCommandQueryRef.current === query) return
+      skillCommandQueryRef.current = query
+      setSkillCommandQuery(query)
+      setSkillCommandSelectedIndex(0)
     }, [])
+
+    const onMessageInputValueChange = useCallback(
+      (value: string) => {
+        latestInputRef.current = value
+        const hasContent = value.trim().length > 0
+        setHasTextContent((prev) => {
+          if (prev === hasContent) return prev
+          return hasContent
+        })
+        const trigger = getTrailingSkillCommand(value)
+        const nextSkillCommandQuery = trigger?.query ?? null
+        updateSkillCommandQuery(nextSkillCommandQuery)
+        // Schedule debounced pre-constructed message update
+        clearTimeout(debouncedUpdateTimerRef.current)
+        debouncedUpdateTimerRef.current = setTimeout(() => flushRef.current(), 300)
+      },
+      [updateSkillCommandQuery]
+    )
+
+    const loadInputSkills = useCallback(async () => {
+      setInputSkillsLoading(true)
+      try {
+        const allSkills = await skillsController.discoverSkills()
+        setInputSkills(allSkills.map((skill) => ({ name: skill.name, description: skill.description })))
+      } catch {
+        setInputSkills([])
+      } finally {
+        setInputSkillsLoading(false)
+      }
+    }, [])
+
+    useEffect(() => {
+      if (skillCommandQuery === null || inputSkills.length > 0 || inputSkillsLoading) {
+        return
+      }
+      void loadInputSkills()
+    }, [inputSkills.length, inputSkillsLoading, loadInputSkills, skillCommandQuery])
+
+    useEffect(() => {
+      return subscribeSkillsChanged(() => {
+        setInputSkills([])
+      })
+    }, [])
+
+    const enabledInputSkills = useMemo(
+      () => inputSkills.filter((skill) => enabledSkillNames.includes(skill.name)),
+      [enabledSkillNames, inputSkills]
+    )
+    const matchingInputSkills = useMemo(() => {
+      if (skillCommandQuery === null) return []
+      const query = skillCommandQuery.trim().toLowerCase()
+      const matchingSkills = query
+        ? enabledInputSkills.filter(
+            (skill) => skill.name.toLowerCase().includes(query) || skill.description.toLowerCase().includes(query)
+          )
+        : enabledInputSkills
+      return matchingSkills.slice(0, 8)
+    }, [enabledInputSkills, skillCommandQuery])
+
+    useEffect(() => {
+      setSkillCommandSelectedIndex((index) => Math.min(index, Math.max(0, matchingInputSkills.length - 1)))
+    }, [matchingInputSkills.length])
+
+    const insertSkillCommand = useCallback(
+      (skillName: string) => {
+        messageInputFieldRef.current?.setValue((prev) => insertSkillCommandText(prev, skillName))
+        updateSkillCommandQuery(null)
+        setTimeout(() => {
+          dom.focusMessageInput()
+          dom.setMessageInputCursorToEnd()
+        }, 0)
+      },
+      [updateSkillCommandQuery]
+    )
 
     // Pre-constructed message state (scoped by session)
     const [preConstructedMessage, setPreConstructedMessage] = useAtom(
@@ -308,7 +390,6 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
     const preConstructedMessageRef = useRef(preConstructedMessage)
     preConstructedMessageRef.current = preConstructedMessage
     const activeFilePreprocessingKeysRef = useRef(new Set<string>())
-    const inputFileKeyByFileRef = useRef(new WeakMap<File, string>())
     useEffect(() => {
       draftMessageIdRef.current = preConstructedMessage.draftMessageId
     }, [preConstructedMessage.draftMessageId])
@@ -317,6 +398,70 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
 
     const { session: currentSession } = useSession(sessionId || null)
     const { sessionSettings: currentSessionMergedSettings } = useSessionSettings(sessionId || null)
+    const pendingApprovalToolCallId = useMemo(
+      () => listPendingApprovalToolCalls(currentSession?.messages ?? [])[0]?.toolCallId,
+      [currentSession?.messages]
+    )
+    const isAwaitingToolApproval = Boolean(pendingApprovalToolCallId)
+
+    const skillMenuOpen = skillCommandQuery !== null && matchingInputSkills.length > 0 && !isAwaitingToolApproval
+
+    // Floating UI autoUpdate：跟随 anchor（含纯 position 变化的响应式过渡），替代手写 RO/rAF 状态机
+    useLayoutEffect(() => {
+      if (!skillMenuOpen) return
+      const reference = skillMenuAnchorRef.current
+      const floating = skillMenuFloatingRef.current
+      if (!reference || !floating) return
+
+      return autoUpdate(reference, floating, () => {
+        void computePosition(reference, floating, {
+          placement: 'top-start',
+          strategy: 'fixed',
+          middleware: [
+            offset(4),
+            flip({ padding: 8 }),
+            shift({ padding: 8 }),
+            size({
+              padding: 8,
+              apply({ availableHeight, rects, elements }) {
+                Object.assign(elements.floating.style, {
+                  maxHeight: `${Math.max(48, Math.min(208, availableHeight))}px`,
+                  width: `${rects.reference.width}px`,
+                })
+              },
+            }),
+          ],
+        }).then(({ x, y, strategy }) => {
+          Object.assign(floating.style, {
+            position: strategy,
+            left: `${x}px`,
+            top: `${y}px`,
+          })
+        })
+      })
+    }, [skillMenuOpen, matchingInputSkills.length])
+
+    const { providers } = useProviders()
+    const {
+      effectiveProviderOptions,
+      modelInfo,
+      reasoningModelInfo,
+      selectedProviderInfo,
+      settingsPatch: reasoningSettingsPatch,
+      handleReasoningLevelChange,
+      markSettingsCommitted: markReasoningSettingsCommitted,
+      waitForPendingPersist: waitForReasoningPersist,
+    } = useReasoningControlState({
+      currentSessionId,
+      isNewSession,
+      model,
+      providers,
+      sessionProviderOptions: resolveReasoningProviderOptions(
+        currentSessionMergedSettings,
+        model?.provider,
+        model?.modelId
+      ),
+    })
 
     // Get current messages for token counting - will only recalculate when stable messages actually change
     // Uses getContextMessageIds to respect compaction points
@@ -329,9 +474,11 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
 
     const { knowledgeBase, setKnowledgeBase } = useKnowledgeBase({ isNewSession })
 
+    // Agent mode value for conditional toolbar rendering
+    const agentModeEntry = useSessionAgentMode(currentSessionId || 'new')
+
     const [showCompressionModal, setShowCompressionModal] = useState(false)
 
-    const [links, setLinks] = useAtom(atoms.inputBoxLinksFamily(currentSessionId || 'new'))
     const [isSubmitting, setIsSubmitting] = useState(false)
     const [unreadyAttachmentSubmitPrompt, setUnreadyAttachmentSubmitPrompt] = useState<{
       opened: boolean
@@ -346,30 +493,28 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         text,
         pictureKeys,
         preConstructedMessage.preprocessedFiles,
-        preConstructedMessage.preprocessedLinks
+        []
       )
       setPreConstructedMessage((prev) => ({
         ...prev,
         text,
         pictureKeys,
         attachments,
-        links,
+        links: [],
         message: constructedMessage,
       }))
     }, [
       preConstructedMessage.draftMessageId,
       pictureKeys,
       attachments,
-      links,
       preConstructedMessage.preprocessedFiles,
-      preConstructedMessage.preprocessedLinks,
       setPreConstructedMessage,
     ])
 
     const flushRef = useRef(flushPreConstructedMessage)
     flushRef.current = flushPreConstructedMessage
 
-    // When non-text deps change (pictures, attachments, links), flush immediately
+    // When non-text deps change (pictures, attachments), flush immediately
     useEffect(() => {
       flushRef.current()
     }, [flushPreConstructedMessage])
@@ -382,10 +527,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       const hasProcessingFiles = Object.values(preConstructedMessage.preprocessingStatus.files || {}).some(
         (status) => status === 'processing'
       )
-      const hasProcessingLinks = Object.values(preConstructedMessage.preprocessingStatus.links || {}).some(
-        (status) => status === 'processing'
-      )
-      return hasProcessingFiles || hasProcessingLinks
+      return hasProcessingFiles
     }, [preConstructedMessage.preprocessingStatus])
 
     // Check if any preprocessing has errors
@@ -393,10 +535,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       const hasErrorFiles = Object.values(preConstructedMessage.preprocessingStatus.files || {}).some(
         (status) => status === 'error'
       )
-      const hasErrorLinks = Object.values(preConstructedMessage.preprocessingStatus.links || {}).some(
-        (status) => status === 'error'
-      )
-      return hasErrorFiles || hasErrorLinks
+      return hasErrorFiles
     }, [preConstructedMessage.preprocessingStatus])
 
     const hasBlockedSessionRagFiles = useMemo(
@@ -423,11 +562,10 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
     )
 
     const disableSubmit = useMemo(
-      () => !(hasTextContent || links?.length || attachments?.length || pictureKeys?.length),
-      [hasTextContent, links, attachments, pictureKeys]
+      () => !(hasTextContent || attachments?.length || pictureKeys?.length),
+      [hasTextContent, attachments, pictureKeys]
     )
 
-    const { providers } = useProviders()
     const preprocessedSessionAttachmentIds = useMemo(
       () =>
         Array.from(
@@ -496,27 +634,35 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       if (!model) {
         return t('Select Model')
       }
-      const providerInfo = providers.find((p) => p.id === model.provider)
-
-      const modelInfo = (providerInfo?.models || providerInfo?.defaultSettings?.models)?.find(
+      const modelInfo = (selectedProviderInfo?.models || selectedProviderInfo?.defaultSettings?.models)?.find(
         (m) => m.modelId === model.modelId
       )
       return `${modelInfo?.nickname || model.modelId}`
-    }, [providers, model, t])
+    }, [selectedProviderInfo, model, t])
 
-    // Get model info for context window
-    const modelInfo = useMemo(() => {
-      if (!model) return null
-      const providerInfo = providers.find((p) => p.id === model.provider)
-      return (providerInfo?.models || providerInfo?.defaultSettings?.models)?.find((m) => m.modelId === model.modelId)
-    }, [providers, model])
+    // When agent mode is on, block models that don't support agent tools in the model selector.
+    const agentModeDisabledMessage = t('This model does not support Agent Mode')
+    const modelDisabledCheck = useCallback(
+      (m: ProviderModelInfo) => {
+        if (agentModeEntry.value !== 'on') return undefined
+        if (!m.capabilities?.includes('tool_use')) return agentModeDisabledMessage
+        if (isDeepSeekWeakToolUse(m.modelId, 'agent')) return agentModeDisabledMessage
+        return undefined
+      },
+      [agentModeDisabledMessage, agentModeEntry.value]
+    )
 
-    // Check if model supports tool use for files
-    const { data: modelSupportToolUseForFile = false, isFetched: isModelToolCapabilityFetched } = useQuery({
+    // Check model tool use capabilities for agent mode and file handling.
+    // Uses 'agent' scope as the gate — models with weak function calling
+    // (e.g. DeepSeek V3/R1) return false, disabling agent mode entirely.
+    const {
+      data: modelToolCapabilities = { agentMode: false, readFile: false },
+      isFetched: isModelToolCapabilityFetched,
+    } = useQuery({
       queryKey: ['model-tool-capability', model?.provider, model?.modelId],
       queryFn: async () => {
         if (!model?.provider || !model?.modelId) {
-          return false
+          return { agentMode: false, readFile: false }
         }
 
         try {
@@ -531,18 +677,33 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
           }
 
           const modelInstance = getModel(settings, globalSettings, configs, dependencies)
-          return modelInstance.isSupportToolUse('read-file')
+          return {
+            agentMode: modelInstance.isSupportToolUse('agent'),
+            readFile: modelInstance.isSupportToolUse('read-file'),
+          }
         } catch (e) {
           console.debug('useModelToolCapability: failed to check capability', e)
-          return false
+          return { agentMode: false, readFile: false }
         }
       },
       enabled: !!(model?.provider && model?.modelId),
       staleTime: 5 * 60 * 1000,
       gcTime: 10 * 60 * 1000,
     })
+    const modelSupportToolUseForFile = modelToolCapabilities.readFile
+    const modelSupportsAgentMode = modelToolCapabilities.agentMode
     const showSessionRetrievalToolWarning =
       hasSessionRetrievalFiles && isModelToolCapabilityFetched && !modelSupportToolUseForFile
+    const agentModeUIState = useMemo(
+      () => getAgentModeUIState(agentModeEntry, model ? modelSupportsAgentMode : true),
+      [agentModeEntry, model, modelSupportsAgentMode]
+    )
+
+    // Determine sandbox mode: files exist in session and model supports tool use for files
+    const sandboxMode = useMemo(() => {
+      if (!modelSupportToolUseForFile || !currentSession) return false
+      return currentSession.messages.some((m) => m.files?.length)
+    }, [modelSupportToolUseForFile, currentSession?.messages])
 
     // Calculate token counts using unified cache layer
     const { contextTokens, currentInputTokens, totalTokens, isCalculating, pendingTasks, messageCount } =
@@ -552,10 +713,11 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         settings: currentSessionMergedSettings || {},
         model,
         modelSupportToolUseForFile,
+        sandboxMode,
         constructedMessage: preConstructedMessage.message,
       })
 
-    const globalSettings = useSettingsStore((state) => state)
+    const globalAutoCompaction = useSettingsStore((state) => state.autoCompaction)
     const [isCompacting, setIsCompacting] = useState(false)
 
     const compactionUIStateMap = useAtomValue(compactionUIStateMapAtom)
@@ -563,11 +725,19 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       if (!currentSessionId || isNewSession) return false
       return compactionUIStateMap[currentSessionId]?.status === 'running'
     }, [compactionUIStateMap, currentSessionId, isNewSession])
+    const submitBlocked =
+      disableSubmit ||
+      isPreprocessing ||
+      isSubmitting ||
+      isCompactionRunning ||
+      isAwaitingToolApproval ||
+      hasPreprocessErrors ||
+      hasBlockedSessionRagFiles
 
     const autoCompactionEnabled = useMemo(() => {
-      if (!currentSession) return globalSettings.autoCompaction ?? true
-      return isAutoCompactionEnabled(currentSession.settings, globalSettings)
-    }, [currentSession, globalSettings])
+      if (!currentSession) return globalAutoCompaction ?? true
+      return isAutoCompactionEnabled(currentSession.settings, settingsStore.getState())
+    }, [currentSession, globalAutoCompaction])
 
     const contextWindowKnown = useMemo(() => {
       if (!model?.modelId) return false
@@ -627,20 +797,6 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       [currentSessionId, isNewSession]
     )
 
-    const [showSelectModelErrorTip, setShowSelectModelErrorTip] = useState(false)
-    useEffect(() => {
-      if (showSelectModelErrorTip) {
-        const clickEventListener = () => {
-          setShowSelectModelErrorTip(false)
-          document.removeEventListener('click', clickEventListener)
-        }
-        document.addEventListener('click', clickEventListener)
-        return () => {
-          document.removeEventListener('click', clickEventListener)
-        }
-      }
-    }, [showSelectModelErrorTip])
-
     const [showRollbackThreadButton, setShowRollbackThreadButton] = useState(false)
     useEffect(() => {
       if (showRollbackThreadButton) {
@@ -670,36 +826,28 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
     resetHistoryIndexRef.current = resetHistoryIndex
 
     type SubmitOptions = { allowUnreadySessionAttachments?: boolean }
+    type InsertFilesOptions = { source?: 'pasted-text' }
     const handleSubmitRef = useRef<(needGenerating?: boolean, options?: SubmitOptions) => void>(() => {})
     const getPreviousHistoryInputRef = useRef(getPreviousHistoryInput)
     getPreviousHistoryInputRef.current = getPreviousHistoryInput
     const getNextHistoryInputRef = useRef(getNextHistoryInput)
     getNextHistoryInputRef.current = getNextHistoryInput
-    const insertFilesRef = useRef<(files: File[]) => void>(() => {})
-    const insertLinksRef = useRef<(urls: string[]) => void>(() => {})
+    const insertFilesRef = useRef<(files: File[], options?: InsertFilesOptions) => void>(() => {})
 
-    const closeSelectModelErrorTipCb = useRef<NodeJS.Timeout>()
     const handleSubmit = async (needGenerating = true, options: SubmitOptions = {}) => {
       if (
         disableSubmit ||
         generating ||
         isSubmitting ||
         isPreprocessing ||
+        isAwaitingToolApproval ||
         hasPreprocessErrors ||
         hasBlockedSessionRagFiles
       ) {
         return
       }
 
-      // 未选择模型时 显示error tip
       if (!model) {
-        // 如果不延时执行，会导致error tip 立即消失
-        await delay(100)
-        if (closeSelectModelErrorTipCb.current) {
-          clearTimeout(closeSelectModelErrorTipCb.current)
-        }
-        setShowSelectModelErrorTip(true)
-        closeSelectModelErrorTipCb.current = setTimeout(() => setShowSelectModelErrorTip(false), 5000)
         return
       }
 
@@ -741,7 +889,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
           latestInputRef.current,
           pictureKeys,
           preprocessedFilesForSubmit,
-          preConstructedMessage.preprocessedLinks
+          []
         )
         if (!latestMessage) {
           console.error('No constructed message available')
@@ -753,9 +901,9 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         const params = {
           constructedMessage: latestMessage,
           needGenerating,
+          settingsPatch: reasoningSettingsPatch,
           onUserMessageReady: () => {
             messageInputFieldRef.current?.clearDraft()
-            setLinks([])
             draftMessageIdRef.current = undefined
             setPreConstructedMessage({
               draftMessageId: undefined,
@@ -776,11 +924,15 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               message: undefined,
             })
             setShowRollbackThreadButton(false)
+            markReasoningSettingsCommitted()
             if (platform.type !== 'mobile' && messageTextForHistory) {
               addInputBoxHistory(messageTextForHistory)
             }
           },
         }
+
+        // Ensure an in-flight reasoning-level persist has landed before generation reads session settings
+        await waitForReasoningPersist()
 
         await onSubmit?.(params)
 
@@ -796,6 +948,34 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
 
     const onKeyDown = useCallback(
       (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        if (skillCommandQuery !== null && matchingInputSkills.length > 0) {
+          if (event.key === 'ArrowDown') {
+            event.preventDefault()
+            setSkillCommandSelectedIndex((index) => (index + 1) % matchingInputSkills.length)
+            return
+          }
+          if (event.key === 'ArrowUp') {
+            event.preventDefault()
+            setSkillCommandSelectedIndex(
+              (index) => (index - 1 + matchingInputSkills.length) % matchingInputSkills.length
+            )
+            return
+          }
+          if (event.key === 'Enter' || event.key === 'Tab') {
+            event.preventDefault()
+            const selectedSkill = matchingInputSkills[skillCommandSelectedIndex]
+            if (selectedSkill) {
+              insertSkillCommand(selectedSkill.name)
+            }
+            return
+          }
+        }
+        if (skillCommandQuery !== null && event.key === 'Escape') {
+          event.preventDefault()
+          updateSkillCommandQuery(null)
+          return
+        }
+
         const isPressedHash: Record<ShortcutSendValue, boolean> = {
           '': false,
           Enter: event.keyCode === 13 && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey,
@@ -805,9 +985,11 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
           'Shift+Enter': event.keyCode === 13 && event.shiftKey,
           'Ctrl+Shift+Enter': event.keyCode === 13 && event.ctrlKey && event.shiftKey,
         }
+        const isSendShortcut = isPressedHash[shortcuts.inputBoxSendMessage]
+        const isSendWithoutResponseShortcut = isPressedHash[shortcuts.inputBoxSendMessageWithoutResponse]
 
         // 发送消息
-        if (isPressedHash[shortcuts.inputBoxSendMessage]) {
+        if (isSendShortcut) {
           if (platform.type === 'mobile' && isSmallScreen && shortcuts.inputBoxSendMessage === 'Enter') {
             // 移动端点击回车不会发送消息
             return
@@ -818,7 +1000,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         }
 
         // 发送消息但不生成回复
-        if (isPressedHash[shortcuts.inputBoxSendMessageWithoutResponse]) {
+        if (isSendWithoutResponseShortcut) {
           event.preventDefault()
           handleSubmitRef.current(false)
           return
@@ -856,7 +1038,15 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
           messageInputFieldRef.current?.getElement()?.blur()
         }
       },
-      [shortcuts, isSmallScreen]
+      [
+        insertSkillCommand,
+        isSmallScreen,
+        matchingInputSkills,
+        shortcuts,
+        skillCommandQuery,
+        skillCommandSelectedIndex,
+        updateSkillCommandQuery,
+      ]
     )
 
     const startNewThread = () => {
@@ -873,52 +1063,23 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       }
     }
 
-    // ----- Preprocessing helpers -----
-    const startLinkPreprocessing = (url: string) => {
-      // 设置为处理中状态
-      setPreConstructedMessage((prev) => markLinkProcessing(prev, url))
-
-      // 异步预处理链接，失败时标记为 error，并吞掉异常避免 Promise.all reject
-      const preprocessPromise = sessionHelpers
-        .preprocessLink(url, { provider: model?.provider || '', modelId: model?.modelId || '' })
-        .then((preprocessedLink) => {
-          setPreConstructedMessage((prev) => onLinkProcessed(prev, url, preprocessedLink, 6))
-        })
-        .catch((error) => {
-          setPreConstructedMessage((prev) =>
-            onLinkProcessed(
-              prev,
-              url,
-              {
-                url,
-                title: '',
-                content: '',
-                storageKey: '',
-                error: (error as Error)?.message || 'Failed to preprocess the link.',
-              },
-              6
-            )
-          )
-        })
-
-      // Store the promise
-      setPreConstructedMessage((prev) => storeLinkPromise(prev, url, preprocessPromise))
-    }
-
-    const startFilePreprocessing = (file: File) => {
+    const startFilePreprocessing = (file: File, options: InsertFilesOptions = {}) => {
       const fileKey = StorageKeyGenerator.fileUniqKey(file)
-      inputFileKeyByFileRef.current.set(file, fileKey)
       activeFilePreprocessingKeysRef.current.add(fileKey)
 
       // 异步预处理文件，失败时标记为 error，并吞掉异常避免 Promise.all reject
       return sessionHelpers
-        .prepareFileAttachment(file, { provider: model?.provider || '', modelId: model?.modelId || '' })
+        .prepareFileAttachment(
+          file,
+          { provider: model?.provider || '', modelId: model?.modelId || '' },
+          { agentMode: isAgentModeActive, source: options.source }
+        )
         .then(async (preprocessedFile) => {
           if (!activeFilePreprocessingKeysRef.current.has(fileKey)) {
             return
           }
 
-          let nextPreprocessedFile: PreprocessedFile = { ...preprocessedFile, inputFileKey: fileKey }
+          let nextPreprocessedFile: PreprocessedFile = preprocessedFile
           if (platform.type === 'desktop') {
             const draftMessageId = draftMessageIdRef.current || uuidv4()
             const indexedFile = await startPreparedSessionAttachmentIndexing({
@@ -951,7 +1112,6 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               file,
               {
                 file,
-                inputFileKey: fileKey,
                 content: '',
                 storageKey: '',
                 error: (error as Error)?.message || 'Failed to preprocess the file.',
@@ -966,29 +1126,12 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         })
     }
 
-    const insertLinks = (urls: string[]) => {
-      const MAX_LINKS = 6
-      const dedupedLinks = _.uniqBy([...(links || []), ...urls.map((u) => ({ url: u }))], 'url')
-      // 保留最先添加的前 6 个链接，多出来的直接丢弃（而非静默丢掉最早的）
-      const newLinks = dedupedLinks.slice(0, MAX_LINKS)
-      setLinks(newLinks)
+    // In agent mode, allow all file types (sandbox can handle archives, binaries, etc.)
+    // isActive is true only for 'on' — 'auto' and mobile/web behave like normal mode,
+    // so they keep the standard file-type validation and accept filter.
+    const isAgentModeActive = agentModeUIState.isActive
 
-      if (dedupedLinks.length > newLinks.length) {
-        toastActions.add(
-          t('Only the first {{limit}} links can be attached. The extra links were skipped.', { limit: MAX_LINKS })
-        )
-      }
-
-      // 只预处理实际保留下来的链接（findIndex 返回 -1 表示该链接已被裁剪，跳过）
-      for (const url of urls) {
-        const linkIndex = newLinks.findIndex((l) => l.url === url)
-        if (linkIndex >= 0 && linkIndex < MAX_LINKS) {
-          startLinkPreprocessing(url)
-        }
-      }
-    }
-
-    const insertFiles = async (files: File[]) => {
+    const insertFiles = async (files: File[], options: InsertFilesOptions = {}) => {
       const MAX_IMAGES = 8
       const MAX_ATTACHMENTS = 20
       // 用本地累加器跟踪本次新增数量：同步循环内 state/ref 可能尚未刷新，靠它做无竞态的限额判断
@@ -1016,18 +1159,15 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         } else {
           if (file.size > KNOWLEDGE_BASE_MAX_FILE_SIZE) {
             toastActions.add(
-              t(
-                'Chat attachments must be {{limit}} or smaller. Please upload larger documents through Knowledge Base.',
-                {
-                  limit: KNOWLEDGE_BASE_MAX_FILE_SIZE_LABEL,
-                }
-              )
+              t('Chat attachments must be {{limit}} or smaller.', {
+                limit: KNOWLEDGE_BASE_MAX_FILE_SIZE_LABEL,
+              })
             )
             continue
           }
 
-          // Check if file type is supported
-          if (!isSupportedFile(file.name)) {
+          // In agent mode, skip file type validation (sandbox handles any file type)
+          if (!isAgentModeActive && !isSupportedFile(file.name)) {
             const unsupportedType = getUnsupportedFileType(file.name)
             let errorMsg = t('Unsupported file type: {{fileName}}', { fileName: file.name })
             if (unsupportedType === 'iwork') {
@@ -1070,7 +1210,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               (f) => f.name === file.name && f.lastModified === file.lastModified
             )
             if (fileIndex >= 0 && fileIndex < MAX_ATTACHMENTS) {
-              const preprocessPromise = startFilePreprocessing(file)
+              const preprocessPromise = startFilePreprocessing(file, options)
               return {
                 ...storeFilePromise(markFileProcessing({ ...prev, draftMessageId }, file), file, preprocessPromise),
                 attachments: newAttachments,
@@ -1101,7 +1241,6 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       }
     }
     insertFilesRef.current = insertFiles
-    insertLinksRef.current = insertLinks
 
     const onFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
       if (!event.target.files) {
@@ -1133,6 +1272,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
         if (sessionType === 'picture') {
           return
         }
+
         if (event.clipboardData?.items) {
           // 对于 Doc/PPT/XLS 等文件中的内容，粘贴时一般会有 4 个 items，分别是 text 文本、html、某格式和图片
           // 因为 getAsString 为异步操作，无法根据 items 中的内容来定制不同的粘贴行为，因此这里选择了最简单的做法：
@@ -1153,21 +1293,13 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
             }
             hasText = true
             if (item.kind === 'string' && item.type === 'text/plain') {
-              // 插入链接：如果复制的是链接，则插入链接
               item.getAsString((text) => {
                 const raw = text.trim()
-                if (raw.startsWith('http://') || raw.startsWith('https://')) {
-                  const urls = raw
-                    .split(/\s+/)
-                    .map((url) => url.trim())
-                    .filter((url) => url.startsWith('http://') || url.startsWith('https://'))
-                  insertLinksRef.current(urls)
-                }
                 if (pasteLongTextAsAFile && raw.length > 3000) {
                   const file = new File([text], `pasted_text_${Date.now()}.txt`, {
                     type: 'text/plain',
                   })
-                  insertFilesRef.current([file])
+                  insertFilesRef.current([file], { source: 'pasted-text' })
                   messageInputFieldRef.current?.setValue(prePasteText) // 删除掉默认粘贴进去的长文本
                 }
               })
@@ -1182,24 +1314,18 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       [sessionType, pasteLongTextAsAFile]
     )
 
-    const handleAttachLink = async () => {
-      const links: string[] = await NiceModal.show('attach-link')
-      if (links) {
-        insertLinks(links)
-      }
-    }
-
     // 拖拽上传
     const { getRootProps, getInputProps } = useDropzone({
       onDrop: (acceptedFiles: File[], fileRejections) => {
         insertFiles(acceptedFiles)
-        // Show toast for rejected files
+        // Show toast for rejected files (only in non-agent mode, agent mode accepts all)
         if (fileRejections.length > 0) {
           const rejectedNames = fileRejections.map((r) => r.file.name).join(', ')
           toastActions.add(t('Unsupported file type: {{fileName}}', { fileName: rejectedNames }))
         }
       },
-      accept: getFileAcceptConfig(),
+      // In agent mode, accept all file types; otherwise restrict to supported formats
+      accept: isAgentModeActive ? undefined : getFileAcceptConfig(),
       noClick: true,
       noKeyboard: true,
     })
@@ -1244,7 +1370,10 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
       return (
         <Box pt={0} pb={isSmallScreen ? 'md' : 'sm'} px="sm" id={dom.InputBoxID}>
           <Stack
-            className={cn('rounded-2xl bg-chatbox-background-secondary', widthFull ? 'w-full' : 'max-w-4xl mx-auto')}
+            className={cn(
+              'rounded-lg bg-chatbox-background-secondary shadow-[0_8px_48px_-8px_rgba(0,0,0,0.15)] dark:shadow-[0_8px_48px_-8px_rgba(0,0,0,0.5)]',
+              widthFull ? 'w-full' : 'max-w-4xl mx-auto'
+            )}
             gap="xs"
             p="md"
             align="center"
@@ -1261,27 +1390,91 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
     }
 
     return (
-      <Box pt={0} pb={isSmallScreen ? 'md' : 'sm'} px="sm" id={dom.InputBoxID} {...getRootProps()}>
+      <Box
+        pt={0}
+        pb={isSmallScreen ? 'md' : 'sm'}
+        px="sm"
+        id={dom.InputBoxID}
+        className="overflow-visible"
+        {...getRootProps()}
+      >
         <input className="hidden" {...getInputProps()} />
-        <Stack className={cn(widthFull ? 'w-full' : 'max-w-4xl mx-auto')} gap="xs">
+        <Stack className={cn('overflow-visible', widthFull ? 'w-full' : 'max-w-4xl mx-auto')} gap="xs">
           {currentSessionId && <CompactionStatus sessionId={currentSessionId} />}
-          <Stack
+          <Box
+            ref={skillMenuAnchorRef}
             className={cn(
-              'rounded-md bg-chatbox-background-secondary justify-between px-3 py-2',
+              // min-h + justify-between 必须同层，桌面空输入时工具栏贴底
+              'relative flex flex-col justify-between gap-xs rounded-lg bg-chatbox-background-secondary px-3 py-2 shadow-[0_4px_20px_-2px_rgba(0,0,0,0.1)] dark:shadow-[0_4px_20px_-2px_rgba(0,0,0,0.3)]',
               !isSmallScreen && 'min-h-[92px]'
             )}
-            style={{ border: '1px solid var(--chatbox-border-primary)' }}
-            gap="xs"
+            style={{ border: '0.5px solid var(--chatbox-border-primary)' }}
           >
+            {/*
+              skill 列表：Portal + Floating UI autoUpdate
+              - 不撑高 InputBox；逃出 overflow-hidden
+              - 持续跟随 anchor（含双向 resize / 纯 position 过渡）
+              - size middleware 按可用高度限 maxHeight
+            */}
+            {skillMenuOpen &&
+              createPortal(
+                <Box
+                  ref={skillMenuFloatingRef}
+                  className="z-[400] overflow-y-auto rounded-lg border border-solid border-chatbox-border-primary bg-chatbox-background-primary py-1 shadow-lg"
+                  style={{ position: 'fixed', top: 0, left: 0 }}
+                >
+                  {matchingInputSkills.map((skill, index) => (
+                    <UnstyledButton
+                      key={skill.name}
+                      className={cn(
+                        'flex w-full items-start gap-2 px-2 py-1.5 text-left transition-colors',
+                        index === skillCommandSelectedIndex
+                          ? 'bg-chatbox-background-tertiary'
+                          : 'hover:bg-chatbox-background-tertiary'
+                      )}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => insertSkillCommand(skill.name)}
+                    >
+                      <IconWand
+                        size={14}
+                        strokeWidth={1.8}
+                        className="mt-0.5 shrink-0 text-[var(--chatbox-tint-secondary)]"
+                      />
+                      <Stack gap={1} className="min-w-0 flex-1">
+                        <Text size="sm" truncate c="chatbox-primary">
+                          /{skill.name}
+                        </Text>
+                        {skill.description && (
+                          <Text size="xs" c="chatbox-secondary" lineClamp={1}>
+                            {skill.description}
+                          </Text>
+                        )}
+                      </Stack>
+                    </UnstyledButton>
+                  ))}
+                </Box>,
+                document.body
+              )}
+
             {/* Input Row */}
-            <Flex align="flex-end" gap={4}>
+            <Flex
+              align="flex-end"
+              gap={4}
+              // Clicking the locked input while approval is pending surfaces the
+              // floating approval pill even when the card is visible in the list.
+              onClickCapture={
+                pendingApprovalToolCallId ? () => notifyApprovalInputNudge(pendingApprovalToolCallId) : undefined
+              }
+            >
               <MessageInputField
                 ref={messageInputFieldRef}
                 isNewSession={isNewSession}
-                isSmallScreen={isSmallScreen}
                 viewportHeight={viewportHeight}
-                isReadOnly={isCompactionRunning}
-                placeholder={t('Type your question here...') || ''}
+                isReadOnly={isCompactionRunning || isAwaitingToolApproval}
+                placeholder={
+                  isAwaitingToolApproval ? t('Waiting for approval') || '' : t('Type your question here...') || ''
+                }
+                ariaLabel={t('Type your question here...') || ''}
                 autoFocus={!isSmallScreen}
                 onValueChange={onMessageInputValueChange}
                 onUserInput={onUserInput}
@@ -1290,53 +1483,34 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
               />
 
               {/* Send Button */}
-              <ActionIcon
-                disabled={
-                  (disableSubmit ||
-                    isPreprocessing ||
-                    isSubmitting ||
-                    isCompactionRunning ||
-                    hasPreprocessErrors ||
-                    hasBlockedSessionRagFiles) &&
-                  !generating
-                }
-                size={32}
-                variant="filled"
-                color={generating ? 'dark' : 'chatbox-brand'}
-                radius="xl"
-                onClick={generating ? onStopGenerating : () => handleSubmit()}
-                className={cn(
-                  'shrink-0 mb-1',
-                  !generating &&
-                    (disableSubmit ||
-                      isPreprocessing ||
-                      isSubmitting ||
-                      isCompactionRunning ||
-                      hasPreprocessErrors ||
-                      hasBlockedSessionRagFiles) &&
-                    'disabled:!opacity-100 !text-white'
-                )}
-                style={
-                  !generating &&
-                  (disableSubmit ||
-                    isPreprocessing ||
-                    isSubmitting ||
-                    isCompactionRunning ||
-                    hasPreprocessErrors ||
-                    hasBlockedSessionRagFiles)
-                    ? { backgroundColor: 'rgba(222, 226, 230, 1)' }
-                    : undefined
-                }
+              <Tooltip
+                // `n` rather than `count`, so i18next does not engage plural resolution for a
+                // label that is only ever shown for more than one reply.
+                label={generatingCount > 1 ? t('Stop all {{n}} replies', { n: generatingCount }) : t('Stop')}
+                disabled={!generating}
+                withArrow
               >
-                {generating ? (
-                  <ScalableIcon icon={IconPlayerStopFilled} size={16} />
-                ) : (
-                  <ScalableIcon icon={IconArrowUp} size={16} />
-                )}
-              </ActionIcon>
+                <ActionIcon
+                  data-testid={generating ? TestId.chat.stop : TestId.chat.send}
+                  disabled={submitBlocked && !generating}
+                  size={32}
+                  variant="filled"
+                  color={generating ? 'dark' : 'chatbox-brand'}
+                  radius="lg"
+                  onClick={generating ? onStopGenerating : () => handleSubmit()}
+                  className={cn('shrink-0 mb-1', !generating && submitBlocked && 'disabled:!opacity-100 !text-white')}
+                  style={!generating && submitBlocked ? { backgroundColor: 'rgba(222, 226, 230, 1)' } : undefined}
+                >
+                  {generating ? (
+                    <ScalableIcon icon={IconPlayerStopFilled} size={16} />
+                  ) : (
+                    <ScalableIcon icon={IconArrowUp} size={16} />
+                  )}
+                </ActionIcon>
+              </Tooltip>
             </Flex>
 
-            {(!!pictureKeys.length || !!attachments.length || !!links.length) && (
+            {(!!pictureKeys.length || !!attachments.length) && (
               <Flex
                 align="center"
                 wrap="wrap"
@@ -1349,7 +1523,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                     aria-live="polite"
                     align="center"
                     gap={8}
-                    className="w-full rounded-md px-2.5 py-2 mb-1"
+                    className="w-full rounded-lg px-2.5 py-2 mb-1"
                     style={{
                       border: '1px solid var(--chatbox-border-primary)',
                       borderLeft: '3px solid var(--chatbox-tint-warning)',
@@ -1380,7 +1554,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                     aria-live="polite"
                     align="center"
                     gap={8}
-                    className="w-full rounded-md px-2.5 py-2 mb-1"
+                    className="w-full rounded-lg px-2.5 py-2 mb-1"
                     style={{
                       border: '1px solid var(--chatbox-border-primary)',
                       borderLeft: '3px solid var(--chatbox-tint-warning)',
@@ -1409,10 +1583,10 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                   <ImageMiniCard key={picKey} storageKey={picKey} onDelete={() => onImageDeleteClick(picKey)} />
                 ))}
                 {attachments?.map((file) => {
-                  const fileKey = inputFileKeyByFileRef.current.get(file) ?? StorageKeyGenerator.fileUniqKey(file)
+                  const fileKey = StorageKeyGenerator.fileUniqKey(file)
                   const status = preConstructedMessage.preprocessingStatus.files[fileKey]
                   const preprocessedFile = preConstructedMessage.preprocessedFiles.find(
-                    (f) => f.inputFileKey === fileKey || StorageKeyGenerator.fileUniqKey(f.file) === fileKey
+                    (f) => StorageKeyGenerator.fileUniqKey(f.file) === fileKey
                   )
                   const effectiveIndexStatus = preprocessedFile?.sessionAttachmentId
                     ? (preprocessedAttachmentIndexStatusMap.get(preprocessedFile.sessionAttachmentId) ??
@@ -1461,6 +1635,7 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                             : status
                       }
                       statusText={statusText}
+                      parserType={preprocessedFile?.parserType}
                       progressValue={progressValue}
                       isTakingLong={isSessionAttachmentTakingLong}
                       errorMessage={effectiveAttachmentError}
@@ -1476,9 +1651,11 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                       onPreviewClick={
                         preprocessedFile?.storageKey
                           ? () => {
+                              const parserLabel = getParserTypeLabel(preprocessedFile?.parserType, t)
                               void NiceModal.show('content-viewer', {
                                 title: `${t('File Content')}: ${file.name}`,
                                 storageKey: preprocessedFile.storageKey,
+                                metadata: parserLabel ? [{ value: parserLabel }] : undefined,
                               })
                             }
                           : undefined
@@ -1511,112 +1688,82 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
                     />
                   )
                 })}
-                {links?.map((link) => {
-                  const linkKey = StorageKeyGenerator.linkUniqKey(link.url)
-                  const status = preConstructedMessage.preprocessingStatus.links[linkKey]
-                  const preprocessedLink = preConstructedMessage.preprocessedLinks.find(
-                    (l) => StorageKeyGenerator.linkUniqKey(l.url) === linkKey
-                  )
-                  return (
-                    <LinkMiniCard
-                      key={linkKey}
-                      url={link.url}
-                      status={status}
-                      errorMessage={preprocessedLink?.error}
-                      onErrorClick={() => {
-                        if (preprocessedLink?.error) {
-                          void NiceModal.show('file-parse-error', {
-                            errorCode: preprocessedLink.error,
-                            fileName: link.url,
-                          })
-                        }
-                      }}
-                      onDelete={() => {
-                        setLinks(links.filter((l) => l.url !== link.url))
-                        setPreConstructedMessage((prev) => cleanupLink(prev, link.url))
-                      }}
-                    />
-                  )
-                })}
               </Flex>
             )}
 
             {/* Toolbar Row */}
             <Flex align="center" gap={0} className="shrink-0 w-full" justify="space-between">
               {/* Hidden file inputs */}
-              <ImageUploadInput ref={pictureInputRef} onChange={onFileInputChange} />
+              <ImageUploadInput
+                ref={pictureInputRef}
+                onChange={onFileInputChange}
+                testId={TestId.chat.attachmentImageInput}
+              />
               <input
+                data-testid={TestId.chat.attachmentFileInput}
                 type="file"
                 ref={fileInputRef}
                 className="hidden"
                 onChange={onFileInputChange}
                 multiple
-                accept={getFileAcceptString()}
+                accept={isAgentModeActive ? undefined : getFileAcceptString()}
               />
 
               {/* Left Group: Tool Buttons */}
               <Flex align="center" gap={0}>
-                <AttachmentMenu
-                  onImageUploadClick={onImageUploadClick}
-                  onFileUploadClick={onFileUploadClick}
-                  handleAttachLink={handleAttachLink}
-                  t={t}
-                />
+                <AttachmentMenu onImageUploadClick={onImageUploadClick} onFileUploadClick={onFileUploadClick} t={t} />
 
-                {featureFlags.mcp && (
-                  <MCPMenu>
-                    {(enabledTools) => (
-                      <UnstyledButton className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors">
-                        <IconHammer
-                          size={toolbarIconSize}
-                          strokeWidth={1.8}
-                          className={
-                            enabledTools > 0
-                              ? 'text-[var(--chatbox-tint-brand)]'
-                              : 'text-[var(--chatbox-tint-secondary)]'
-                          }
-                        />
-                        {enabledTools > 0 && (
-                          <Text size="xs" className="text-[var(--chatbox-tint-brand)]">
-                            {enabledTools}
-                          </Text>
-                        )}
-                      </UnstyledButton>
-                    )}
-                  </MCPMenu>
-                )}
-
-                {featureFlags.knowledgeBase && !isSmallScreen && (
-                  <KnowledgeBaseMenu currentKnowledgeBaseId={knowledgeBase?.id} onSelect={handleKnowledgeBaseSelect}>
-                    <UnstyledButton className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors">
-                      <IconVocabulary
+                {/* Desktop owns Web Search in AgentModePanel for both Chat and Work modes.
+                    Mobile/Web keep this standalone entry because they do not render that panel. */}
+                {platform.type !== 'desktop' && (
+                  <Tooltip label={t('Web Search')} position="top" withArrow disabled={isSmallScreen}>
+                    <UnstyledButton
+                      data-testid={TestId.chat.webSearchToggle}
+                      onClick={() => {
+                        setWebBrowsingMode(!webBrowsingMode)
+                        dom.focusMessageInput()
+                      }}
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors"
+                    >
+                      <IconWorldWww
                         size={toolbarIconSize}
                         strokeWidth={1.8}
                         className={
-                          knowledgeBase ? 'text-[var(--chatbox-tint-brand)]' : 'text-[var(--chatbox-tint-secondary)]'
+                          webBrowsingMode ? 'text-[var(--chatbox-tint-brand)]' : 'text-[var(--chatbox-tint-secondary)]'
                         }
                       />
                     </UnstyledButton>
-                  </KnowledgeBaseMenu>
+                  </Tooltip>
                 )}
 
-                <Tooltip label={t('Web Search')} position="top" withArrow disabled={isSmallScreen}>
-                  <UnstyledButton
-                    onClick={() => {
-                      setWebBrowsingMode(!webBrowsingMode)
+                <ReasoningControlButton
+                  provider={model?.provider}
+                  model={reasoningModelInfo}
+                  providerOptions={effectiveProviderOptions}
+                  iconSize={toolbarIconSize}
+                  compact={isSmallScreen}
+                  onChange={(level) => void handleReasoningLevelChange(level)}
+                />
+
+                {/* Agent Mode Panel - desktop only */}
+                {platform.type === 'desktop' && (
+                  <AgentModeButton
+                    sessionId={currentSessionId || 'new'}
+                    providerId={model?.provider}
+                    modelId={model?.modelId}
+                    iconSize={toolbarIconSize}
+                    compact={isSmallScreen}
+                    modelSupportsAgentMode={model ? modelSupportsAgentMode : true}
+                    webBrowsingMode={webBrowsingMode}
+                    onWebBrowsingChange={(v) => {
+                      setWebBrowsingMode(v)
                       dom.focusMessageInput()
                     }}
-                    className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors"
-                  >
-                    <IconWorldWww
-                      size={toolbarIconSize}
-                      strokeWidth={1.8}
-                      className={
-                        webBrowsingMode ? 'text-[var(--chatbox-tint-brand)]' : 'text-[var(--chatbox-tint-secondary)]'
-                      }
-                    />
-                  </UnstyledButton>
-                </Tooltip>
+                    currentKnowledgeBaseId={knowledgeBase?.id}
+                    onKnowledgeBaseSelect={handleKnowledgeBaseSelect}
+                    onSkillSelect={insertSkillCommand}
+                  />
+                )}
 
                 {!isSmallScreen &&
                   (showRollbackThreadButton ? (
@@ -1737,56 +1884,45 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
 
                 {/* Model Selector */}
                 <Box className="min-w-0 flex-1 justify-end max-w-[200px]">
-                  <Tooltip
-                    label={
-                      <Flex align="center" c="white" gap="xxs" min-w-0>
-                        <ScalableIcon icon={IconAlertCircle} size={12} className="text-inherit" />
-                        <Text span size="xxs" c="white">
-                          {t('Please select a model')}
-                        </Text>
-                      </Flex>
-                    }
-                    color="dark"
-                    opened={showSelectModelErrorTip}
-                    withArrow
+                  <ModelSelectorV2
+                    onSelect={onSelectModel}
+                    selectedProviderId={model?.provider}
+                    selectedModelId={model?.modelId}
+                    modelDisabledCheck={modelDisabledCheck}
+                    pageName={JK_PAGE_NAMES.CHAT_PAGE}
+                    position="top-end"
+                    transitionProps={{
+                      transition: 'fade-up',
+                      duration: 200,
+                    }}
                   >
-                    <ModelSelector
-                      onSelect={onSelectModel}
-                      selectedProviderId={model?.provider}
-                      selectedModelId={model?.modelId}
-                      position="top-end"
-                      transitionProps={{
-                        transition: 'fade-up',
-                        duration: 200,
-                      }}
+                    <UnstyledButton
+                      className={cn(
+                        'flex min-w-0 max-w-full items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors',
+                        !model && 'animate-pulse bg-blue-500/20'
+                      )}
                     >
-                      <UnstyledButton
+                      {!!model && <ProviderImageIcon size={18} provider={model.provider} />}
+                      <Text
+                        size="sm"
+                        data-testid={TestId.model.selectorTrigger}
                         className={cn(
-                          'flex min-w-0 max-w-full items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors',
-                          !model && 'animate-pulse bg-blue-500/20'
+                          'min-w-0 flex-1 truncate text-[var(--chatbox-tint-secondary)]',
+                          isSmallScreen ? 'max-w-[100px]' : 'max-w-[160px]'
                         )}
                       >
-                        {!!model && <ProviderImageIcon size={18} provider={model.provider} />}
-                        <Text
-                          size="sm"
-                          className={cn(
-                            'min-w-0 flex-1 truncate text-[var(--chatbox-tint-secondary)]',
-                            isSmallScreen ? 'max-w-[100px]' : 'max-w-[160px]'
-                          )}
-                        >
-                          {modelSelectorDisplayText}
-                        </Text>
-                        <IconChevronRight
-                          size={14}
-                          className="text-[var(--chatbox-tint-tertiary)] rotate-90 flex-shrink-0"
-                        />
-                      </UnstyledButton>
-                    </ModelSelector>
-                  </Tooltip>
+                        {modelSelectorDisplayText}
+                      </Text>
+                      <IconChevronRight
+                        size={14}
+                        className="text-[var(--chatbox-tint-tertiary)] rotate-90 flex-shrink-0"
+                      />
+                    </UnstyledButton>
+                  </ModelSelectorV2>
                 </Box>
               </Flex>
             </Flex>
-          </Stack>
+          </Box>
 
           <Disclaimer />
         </Stack>
@@ -1838,9 +1974,8 @@ const InputBox = forwardRef<InputBoxRef, InputBoxProps>(
 const AttachmentMenu: React.FC<{
   onImageUploadClick: () => void
   onFileUploadClick: () => void
-  handleAttachLink: () => void
   t: (key: string) => string
-}> = ({ onImageUploadClick, onFileUploadClick, handleAttachLink, t }) => {
+}> = ({ onImageUploadClick, onFileUploadClick, t }) => {
   const isSmallScreen = useIsSmallScreen()
   const toolbarIconSize = isSmallScreen ? 22 : 18
   return (
@@ -1857,19 +1992,27 @@ const AttachmentMenu: React.FC<{
       }}
     >
       <Menu.Target>
-        <UnstyledButton className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors">
+        <UnstyledButton
+          data-testid={TestId.chat.attachmentMenuTrigger}
+          className="flex items-center gap-1 px-2 py-1 rounded-lg hover:bg-[var(--chatbox-background-tertiary)] transition-colors"
+        >
           <IconCirclePlus size={toolbarIconSize} strokeWidth={1.8} className="text-[var(--chatbox-tint-secondary)]" />
         </UnstyledButton>
       </Menu.Target>
       <Menu.Dropdown>
-        <Menu.Item leftSection={<IconPhoto size={16} />} onClick={onImageUploadClick}>
+        <Menu.Item
+          data-testid={TestId.chat.attachmentSelectImage}
+          leftSection={<IconPhoto size={16} />}
+          onClick={onImageUploadClick}
+        >
           {t('Attach Image')}
         </Menu.Item>
-        <Menu.Item leftSection={<IconFolder size={16} />} onClick={onFileUploadClick}>
+        <Menu.Item
+          data-testid={TestId.chat.attachmentSelectFile}
+          leftSection={<IconFolder size={16} />}
+          onClick={onFileUploadClick}
+        >
           {t('Select File')}
-        </Menu.Item>
-        <Menu.Item leftSection={<IconLink size={16} />} onClick={handleAttachLink}>
-          {t('Attach Link')}
         </Menu.Item>
       </Menu.Dropdown>
     </Menu>
@@ -1878,105 +2021,3 @@ const AttachmentMenu: React.FC<{
 
 // Memoize the InputBox component to prevent unnecessary re-renders during streaming
 export default memo(InputBox)
-
-// ============================================================================
-// MessageInputField — isolated textarea to prevent parent re-renders on typing
-// ============================================================================
-
-export type MessageInputFieldRef = {
-  getValue: () => string
-  setValue: (val: string | ((prev: string) => string)) => void
-  clearDraft: () => void
-  getElement: () => HTMLTextAreaElement | null
-}
-
-type MessageInputFieldProps = {
-  isNewSession: boolean
-  isSmallScreen: boolean
-  viewportHeight: number
-  isReadOnly: boolean
-  placeholder: string
-  autoFocus: boolean
-  /** Called on every value change (including programmatic setValue). */
-  onValueChange: (value: string) => void
-  /** Called only on real user typing (onChange), not programmatic setValue. */
-  onUserInput?: () => void
-  onKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void
-  onPaste: (event: React.ClipboardEvent<HTMLTextAreaElement>) => void
-}
-
-const MessageInputField = memo(
-  forwardRef<MessageInputFieldRef, MessageInputFieldProps>(
-    (
-      {
-        isNewSession,
-        isSmallScreen,
-        viewportHeight,
-        isReadOnly,
-        placeholder,
-        autoFocus,
-        onValueChange,
-        onUserInput,
-        onKeyDown,
-        onPaste,
-      },
-      ref
-    ) => {
-      const { messageInput, setMessageInput, clearDraft } = useMessageInput('', { isNewSession })
-      const inputRef = useRef<HTMLTextAreaElement | null>(null)
-      const messageInputRef = useRef(messageInput)
-      messageInputRef.current = messageInput
-
-      useEffect(() => {
-        onValueChange(messageInput)
-      }, [messageInput, onValueChange])
-
-      useImperativeHandle(
-        ref,
-        () => ({
-          getValue: () => messageInputRef.current,
-          setValue: (val) => setMessageInput(val),
-          clearDraft: () => clearDraft(),
-          getElement: () => inputRef.current,
-        }),
-        [setMessageInput, clearDraft]
-      )
-
-      const onChange = useCallback(
-        (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-          setMessageInput(event.target.value)
-          onUserInput?.()
-        },
-        [setMessageInput, onUserInput]
-      )
-
-      return (
-        <Textarea
-          unstyled={true}
-          styles={{ input: { fontSize: 14 } }}
-          classNames={{
-            root: 'flex-1',
-            wrapper: 'flex-1',
-            input:
-              'block w-full outline-none border-none px-2 py-1 resize-none bg-transparent text-chatbox-tint-primary leading-6',
-          }}
-          size="sm"
-          id={dom.messageInputID}
-          ref={inputRef}
-          placeholder={placeholder || ''}
-          bg="transparent"
-          autosize={true}
-          minRows={2}
-          maxRows={Math.max(4, Math.floor(viewportHeight / 100))}
-          value={messageInput}
-          autoFocus={autoFocus}
-          readOnly={isReadOnly}
-          onChange={onChange}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          data-testid="message-input"
-        />
-      )
-    }
-  )
-)

@@ -6,6 +6,13 @@ import * as dom from '@/hooks/dom'
 import * as chatStore from '../chatStore'
 import * as scrollActions from '../scrollActions'
 import { _copySession as copySession, switchCurrentSession } from './crud'
+import { getCurrentConversationMessages } from './generation-state'
+
+function cancelCurrentConversationGenerations(session: Session): void {
+  for (const message of getCurrentConversationMessages(session)) {
+    message.cancel?.()
+  }
+}
 
 /**
  * Edit a thread (currently only supports name modification)
@@ -31,7 +38,7 @@ export async function editThread(sessionId: string, threadId: string, newThread:
     return { ...t, ...newThread }
   })
 
-  await chatStore.updateSession(sessionId, { threads })
+  await chatStore.updateSessionWithMessages(sessionId, { threads })
 }
 
 /**
@@ -48,7 +55,7 @@ export async function removeThread(sessionId: string, threadId: string) {
     await removeCurrentThread(sessionId)
     return
   }
-  return await chatStore.updateSession(sessionId, {
+  return await chatStore.updateSessionWithMessages(sessionId, {
     threads: session.threads?.filter((t) => t.id !== threadId),
   })
 }
@@ -67,21 +74,36 @@ export async function switchThread(sessionId: string, threadId: string) {
   if (!target) {
     return
   }
-  for (const m of session.messages) {
-    m?.cancel?.()
-  }
-  const newThreads = session.threads.filter((h) => h.id !== threadId)
-  newThreads.push({
-    id: uuidv4(),
-    name: session.threadName || session.name,
-    messages: session.messages,
-    createdAt: Date.now(),
-  })
-  await chatStore.updateSessionWithMessages(session.id, {
-    ...session,
-    threads: newThreads,
-    messages: target.messages,
-    threadName: target.name,
+  cancelCurrentConversationGenerations(session)
+  // Build the transfer from the queue's current session (not the snapshot
+  // above): a compaction commit may still be persisting, and submitting a
+  // stale full object would overwrite its summary and compaction point.
+  await chatStore.updateSessionWithMessages(sessionId, (current) => {
+    if (!current?.threads) {
+      throw new Error(`Session ${sessionId} not found during thread switch`)
+    }
+    const currentTarget = current.threads.find((h) => h.id === threadId)
+    if (!currentTarget) {
+      return current
+    }
+    // Compaction points travel with their message list: the archived thread
+    // keeps the active conversation's points, the restored conversation takes
+    // the thread's own points (see buildCompactionCommitPatch).
+    const newThreads = current.threads.filter((h) => h.id !== threadId)
+    newThreads.push({
+      id: uuidv4(),
+      name: current.threadName || current.name,
+      messages: current.messages,
+      createdAt: Date.now(),
+      compactionPoints: current.compactionPoints,
+    })
+    return {
+      ...current,
+      threads: newThreads,
+      messages: currentTarget.messages,
+      threadName: currentTarget.name,
+      compactionPoints: currentTarget.compactionPoints,
+    }
   })
   setTimeout(() => scrollActions.scrollToBottom('smooth'), 300)
 }
@@ -95,25 +117,33 @@ export async function refreshContextAndCreateNewThread(sessionId: string) {
   if (!session) {
     return
   }
-  for (const m of session.messages) {
-    m?.cancel?.()
-  }
-  const newThread: SessionThread = {
-    id: uuidv4(),
-    name: session.threadName || session.name,
-    messages: session.messages,
-    createdAt: Date.now(),
-  }
+  cancelCurrentConversationGenerations(session)
+  // Archive from the queue's current session, not the snapshot above: a
+  // compaction commit may still be persisting its summary/point.
+  await chatStore.updateSessionWithMessages(sessionId, (current) => {
+    if (!current) {
+      throw new Error(`Session ${sessionId} not found during thread creation`)
+    }
+    const newThread: SessionThread = {
+      id: uuidv4(),
+      name: current.threadName || current.name,
+      messages: current.messages,
+      createdAt: Date.now(),
+      // The archived conversation keeps its compaction points with it.
+      compactionPoints: current.compactionPoints,
+    }
 
-  let systemPrompt = session.messages.find((m) => m.role === 'system')
-  if (systemPrompt) {
-    systemPrompt = createMessage('system', getMessageText(systemPrompt))
-  }
-  await chatStore.updateSessionWithMessages(session.id, {
-    ...session,
-    threads: session.threads ? [...session.threads, newThread] : [newThread],
-    messages: systemPrompt ? [systemPrompt] : [createMessage('system', defaults.getDefaultPrompt())],
-    threadName: '',
+    let systemPrompt = current.messages.find((m) => m.role === 'system')
+    if (systemPrompt) {
+      systemPrompt = createMessage('system', getMessageText(systemPrompt))
+    }
+    return {
+      ...current,
+      threads: current.threads ? [...current.threads, newThread] : [newThread],
+      messages: systemPrompt ? [systemPrompt] : [createMessage('system', defaults.getDefaultPrompt())],
+      threadName: '',
+      compactionPoints: undefined,
+    }
   })
 }
 
@@ -134,18 +164,27 @@ export async function removeCurrentThread(sessionId: string) {
   if (!session) {
     return
   }
-  const updatedSession: Session = {
-    ...session,
-    messages: session.messages.filter((m) => m.role === 'system').slice(0, 1), // Keep only one system prompt
-    threadName: undefined,
-  }
-  if (session.threads && session.threads.length > 0) {
-    const lastThread = session.threads[session.threads.length - 1]
-    updatedSession.messages = lastThread.messages
-    updatedSession.threads = session.threads.slice(0, session.threads.length - 1)
-    updatedSession.threadName = lastThread.name
-  }
-  await chatStore.updateSession(session.id, updatedSession)
+  cancelCurrentConversationGenerations(session)
+  await chatStore.updateSessionWithMessages(sessionId, (current) => {
+    if (!current) {
+      throw new Error(`Session ${sessionId} not found during thread removal`)
+    }
+    const updatedSession: Session = {
+      ...current,
+      messages: current.messages.filter((m) => m.role === 'system').slice(0, 1), // Keep only one system prompt
+      threadName: undefined,
+      // The discarded conversation takes its compaction points with it.
+      compactionPoints: undefined,
+    }
+    if (current.threads && current.threads.length > 0) {
+      const lastThread = current.threads[current.threads.length - 1]
+      updatedSession.messages = lastThread.messages
+      updatedSession.threads = current.threads.slice(0, current.threads.length - 1)
+      updatedSession.threadName = lastThread.name
+      updatedSession.compactionPoints = lastThread.compactionPoints
+    }
+    return updatedSession
+  })
 }
 
 /**
@@ -159,45 +198,50 @@ export async function compressAndCreateThread(sessionId: string, summary: string
     return
   }
 
-  // Cancel all ongoing message generations
-  for (const m of session.messages) {
-    m?.cancel?.()
-  }
+  cancelCurrentConversationGenerations(session)
 
-  // Create new thread with all messages
-  const newThread: SessionThread = {
-    id: uuidv4(),
-    name: session.threadName || session.name,
-    messages: session.messages,
-    createdAt: Date.now(),
-  }
+  // Archive from the queue's current session, not the snapshot above.
+  await chatStore.updateSessionWithMessages(sessionId, (current) => {
+    if (!current) {
+      throw new Error(`Session ${sessionId} not found during compression`)
+    }
+    // Create new thread with all messages
+    const newThread: SessionThread = {
+      id: uuidv4(),
+      name: current.threadName || current.name,
+      messages: current.messages,
+      createdAt: Date.now(),
+      // The archived conversation keeps its compaction points with it.
+      compactionPoints: current.compactionPoints,
+    }
 
-  // Get original system prompt (if exists)
-  const systemPrompt = session.messages.find((m) => m.role === 'system')
-  let systemPromptText = ''
-  if (systemPrompt) {
-    systemPromptText = getMessageText(systemPrompt)
-  }
+    // Get original system prompt (if exists)
+    const systemPrompt = current.messages.find((m) => m.role === 'system')
+    let systemPromptText = ''
+    if (systemPrompt) {
+      systemPromptText = getMessageText(systemPrompt)
+    }
 
-  // Create new message list with original system prompt and compressed context
-  const newMessages: Message[] = []
+    // Create new message list with original system prompt and compressed context
+    const newMessages: Message[] = []
 
-  // Add system prompt first if exists
-  if (systemPromptText) {
-    newMessages.push(createMessage('system', systemPromptText))
-  }
+    // Add system prompt first if exists
+    if (systemPromptText) {
+      newMessages.push(createMessage('system', systemPromptText))
+    }
 
-  // Add compressed context as user message
-  const compressionContext = `Previous conversation summary:\n\n${summary}`
-  newMessages.push(createMessage('user', compressionContext))
+    // Add compressed context as user message
+    const compressionContext = `Previous conversation summary:\n\n${summary}`
+    newMessages.push(createMessage('user', compressionContext))
 
-  // Save session
-  await chatStore.updateSessionWithMessages(session.id, {
-    ...session,
-    threads: session.threads ? [...session.threads, newThread] : [newThread],
-    messages: newMessages,
-    threadName: '',
-    messageForksHash: undefined,
+    return {
+      ...current,
+      threads: current.threads ? [...current.threads, newThread] : [newThread],
+      messages: newMessages,
+      threadName: '',
+      messageForksHash: undefined,
+      compactionPoints: undefined,
+    }
   })
 
   // Auto-scroll to bottom and focus input

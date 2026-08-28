@@ -1,11 +1,12 @@
 import NiceModal from '@ebay/nice-modal-react'
-import { ActionIcon, Button, Collapse, Flex, Group, Stack, Text, Tooltip } from '@mantine/core'
+import { ActionIcon, Button, Collapse, Flex, Group, Stack, Text } from '@mantine/core'
 import type { Message } from '@shared/types'
 import { getMessageText } from '@shared/utils/message'
 import { IconChevronDown, IconChevronUp, IconPencil, IconTrash } from '@tabler/icons-react'
 import { type FC, memo, useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import Markdown from '@/components/Markdown'
+import { AppTooltip as Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { ScalableIcon } from '../common/ScalableIcon'
@@ -23,7 +24,9 @@ const SummaryMessage: FC<SummaryMessageProps> = ({ msg, className, isLatestSumma
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
-  const { enableMarkdownRendering, enableLaTeXRendering, enableMermaidRendering } = useSettingsStore((state) => state)
+  const enableMarkdownRendering = useSettingsStore((state) => state.enableMarkdownRendering)
+  const enableLaTeXRendering = useSettingsStore((state) => state.enableLaTeXRendering)
+  const enableMermaidRendering = useSettingsStore((state) => state.enableMermaidRendering)
 
   const summaryText = getMessageText(msg)
 
@@ -61,10 +64,11 @@ const SummaryMessage: FC<SummaryMessageProps> = ({ msg, className, isLatestSumma
       </Flex>
 
       <Collapse in={expanded}>
-        <div className="msg-block mt-3 mx-4 p-3 rounded-md bg-chatbox-background-secondary border border-solid border-chatbox-border-primary">
+        <div className="msg-block mt-3 mx-4 p-3 rounded-lg bg-chatbox-background-secondary border border-solid border-chatbox-border-primary">
           {enableMarkdownRendering ? (
             <Markdown
               uniqueId={`summary-${msg.id}`}
+              sessionId={sessionId}
               enableLaTeXRendering={enableLaTeXRendering}
               enableMermaidRendering={enableMermaidRendering}
             >

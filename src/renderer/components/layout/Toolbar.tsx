@@ -3,9 +3,11 @@ import { ActionIcon, Button, Flex } from '@mantine/core'
 import {
   IconClearAll,
   IconCode,
+  IconCopy,
   IconDeviceFloppy,
   IconDots,
   IconHistory,
+  IconId,
   IconSearch,
   IconTrash,
 } from '@tabler/icons-react'
@@ -13,16 +15,18 @@ import { useSetAtom } from 'jotai'
 import { useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useIsLargeScreen, useIsSmallScreen } from '@/hooks/useScreenChange'
+import { copyToClipboard } from '@/packages/navigator'
 import { router } from '@/router'
 import * as atoms from '@/stores/atoms'
-import { deleteSession, getSession } from '@/stores/chatStore'
-import { clear as clearSession } from '@/stores/sessionActions'
+import { confirmSessionDeletion, deleteSession, getSession } from '@/stores/chatStore'
+import { clear as clearSession, copyAndSwitchSession } from '@/stores/sessionActions'
+import * as toastActions from '@/stores/toastActions'
 import { useUIStore } from '@/stores/uiStore'
 import ActionMenu from '../ActionMenu'
+import { ScalableIcon } from '../common/ScalableIcon'
 import Broom from '../icons/Broom'
 import LayoutExpand from '../icons/LayoutExpand'
 import LayoutShrink from '../icons/LayoutShrink'
-import { ScalableIcon } from '../common/ScalableIcon'
 
 /**
  * 顶部标题工具栏（右侧）
@@ -45,6 +49,9 @@ export default function Toolbar({ sessionId }: { sessionId: string }) {
     void clearSession(sessionId)
   }
   const handleSessionDelete = async () => {
+    if (!(await confirmSessionDeletion(sessionId))) {
+      return
+    }
     try {
       await deleteSession(sessionId)
       router.navigate({ to: '/', replace: true })
@@ -60,17 +67,32 @@ export default function Toolbar({ sessionId }: { sessionId: string }) {
     }
   }, [sessionId, t])
 
+  const handleCopySession = useCallback(async () => {
+    const session = await getSession(sessionId)
+    if (session) {
+      await copyAndSwitchSession(session)
+    }
+  }, [sessionId])
+
+  const handleCopySessionId = useCallback(() => {
+    copyToClipboard(sessionId)
+    toastActions.add(t('copied to clipboard'), 2000)
+  }, [sessionId, t])
+
   return !isSmallScreen ? (
     <Flex align="center" gap="md" className="controls">
       {!isSmallScreen ? (
         <Button
           h={28}
           px="xs"
-          radius="sm"
+          radius="lg"
           variant="outline"
           color="chatbox-tertiary"
           leftSection={<ScalableIcon icon={IconSearch} size={16} strokeWidth={1.8} />}
           className="border-chatbox-border-primary"
+          classNames={{
+            label: 'px-1',
+          }}
           onClick={() => setOpenSearchDialog(true)}
         >
           {t('Search')}...
@@ -81,37 +103,36 @@ export default function Toolbar({ sessionId }: { sessionId: string }) {
         </ActionIcon>
       )}
 
-      {isLargeScreen && (
-        <ActionIcon variant="subtle" size={28} color="chatbox-secondary" onClick={() => setWidthFull(!widthFull)}>
-          {widthFull ? <LayoutExpand strokeWidth={1.8} /> : <LayoutShrink strokeWidth={1.8} />}
-        </ActionIcon>
-      )}
-
-      <ActionIcon variant="subtle" size={28} color="chatbox-secondary" onClick={() => setThreadHistoryDrawerOpen(true)}>
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          className="lucide lucide-table-of-contents-icon lucide-table-of-contents"
-        >
-          <path d="M16 5H3" />
-          <path d="M16 12H3" />
-          <path d="M16 19H3" />
-          <path d="M21 5h.01" />
-          <path d="M21 12h.01" />
-          <path d="M21 19h.01" />
-        </svg>
-      </ActionIcon>
-
       <ActionMenu
         position="bottom-end"
         items={[
+          ...(isLargeScreen
+            ? [
+                {
+                  text: widthFull ? t('Standard Width') : t('Full Width'),
+                  icon: widthFull ? LayoutExpand : LayoutShrink,
+                  onClick: () => setWidthFull(!widthFull),
+                },
+              ]
+            : []),
+          {
+            text: t('Thread History'),
+            icon: IconHistory,
+            onClick: () => setThreadHistoryDrawerOpen(true),
+          },
+          {
+            divider: true,
+          },
+          {
+            text: t('Duplicate Conversation'),
+            icon: IconCopy,
+            onClick: handleCopySession,
+          },
+          {
+            text: t('Copy Conversation ID'),
+            icon: IconId,
+            onClick: handleCopySessionId,
+          },
           {
             text: t('Export Chat'),
             icon: IconDeviceFloppy,
@@ -167,7 +188,16 @@ export default function Toolbar({ sessionId }: { sessionId: string }) {
             icon: IconHistory,
             onClick: () => setThreadHistoryDrawerOpen(true),
           },
-
+          {
+            text: t('Duplicate Conversation'),
+            icon: IconCopy,
+            onClick: handleCopySession,
+          },
+          {
+            text: t('Copy Conversation ID'),
+            icon: IconId,
+            onClick: handleCopySessionId,
+          },
           {
             text: t('Export Chat'),
             icon: IconDeviceFloppy,

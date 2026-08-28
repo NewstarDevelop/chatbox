@@ -3,6 +3,7 @@
  * It uses react-query for caching.
  * */
 
+import NiceModal from '@ebay/nice-modal-react'
 import {
   type Message,
   type Session,
@@ -19,6 +20,7 @@ import compact from 'lodash/compact'
 import isEmpty from 'lodash/isEmpty'
 import { useMemo } from 'react'
 import { v4 as uuidv4 } from 'uuid'
+import i18n from '@/i18n'
 import platform from '@/platform'
 import storage, { StorageKey } from '@/storage'
 import type { SessionMetaStorage } from '@/storage/SessionMetaStorage'
@@ -33,14 +35,22 @@ const log = getLogger('chat-store')
 
 import { clearScrollPositionCache } from '@/components/chat/MessageList'
 import { cleanupSessionAtomCache } from './atoms/throttleWriteSessionAtom'
+import {
+  assertNoMessageDataUpdate,
+  getSessionMetadataSnapshot,
+  mergeCachedGeneratingMessages,
+  type SessionMetadataUpdate,
+} from './chatStore-cache'
 import { lastUsedModelStore } from './lastUsedModelStore'
 import queryClient from './queryClient'
+import { clearSessionActivity } from './sessionActivityStore'
 import { getSessionMeta } from './sessionHelpers'
 import { settingsStore, useSettingsStore } from './settingsStore'
 import { UpdateQueue } from './updateQueue'
 
 export const QueryKeys = {
   ChatSessionsList: ['chat-sessions-list'],
+  ArchivedChatSessionsList: ['archived-chat-sessions-list'],
   ChatSession: (id: string) => ['chat-session', id],
   ChatSessionSettings: (id: string) => ['chat-session-settings', id],
 }
@@ -72,6 +82,11 @@ async function _listSessionsMetaPage(cursor: number): Promise<SessionMetaPage> {
   }
 }
 
+export async function listSessionsMetaPage(cursor: number, limit?: number): Promise<SessionMetaPage> {
+  const metaStorage = await getMetaStorage()
+  return await metaStorage.getPage(cursor, limit)
+}
+
 const listSessionsMetaQueryOptions = {
   queryKey: QueryKeys.ChatSessionsList,
   queryFn: ({ pageParam }: { pageParam: number }) => _listSessionsMetaPage(pageParam),
@@ -97,8 +112,53 @@ export async function listSessionsMeta(): Promise<SessionMetaRecord[]> {
 
 /** Get all session metas from storage, bypassing the paginated cache. */
 export async function listAllSessionsMeta(): Promise<SessionMetaRecord[]> {
+  const items: SessionMetaRecord[] = []
+  let cursor: number | null = 0
+  while (cursor !== null) {
+    const page = await listSessionsMetaPage(cursor)
+    items.push(...page.items)
+    cursor = page.nextCursor
+  }
+  return items
+}
+
+async function _listArchivedSessionsMetaPage(cursor: number): Promise<SessionMetaPage> {
   const metaStorage = await getMetaStorage()
-  return await metaStorage.getAll()
+  return await metaStorage.getArchivedPage(cursor)
+}
+
+export async function listArchivedSessionsMetaPage(cursor: number, limit?: number): Promise<SessionMetaPage> {
+  const metaStorage = await getMetaStorage()
+  return await metaStorage.getArchivedPage(cursor, limit)
+}
+
+export async function countSessionsMeta(): Promise<number> {
+  const metaStorage = await getMetaStorage()
+  return await metaStorage.getTotal()
+}
+
+export async function countArchivedSessionsMeta(): Promise<number> {
+  const metaStorage = await getMetaStorage()
+  return await metaStorage.getArchivedTotal()
+}
+
+const listArchivedSessionsMetaQueryOptions = {
+  queryKey: QueryKeys.ArchivedChatSessionsList,
+  queryFn: ({ pageParam }: { pageParam: number }) => _listArchivedSessionsMetaPage(pageParam),
+  getNextPageParam: (lastPage: SessionMetaPage) => lastPage.nextCursor,
+  initialPageParam: 0,
+  staleTime: Infinity,
+}
+
+export async function listArchivedSessionsMeta(): Promise<SessionMetaRecord[]> {
+  const items: SessionMetaRecord[] = []
+  let cursor: number | null = 0
+  while (cursor !== null) {
+    const page = await listArchivedSessionsMetaPage(cursor)
+    items.push(...page.items)
+    cursor = page.nextCursor
+  }
+  return items
 }
 
 export function useSessionList() {
@@ -110,6 +170,19 @@ export function useSessionList() {
     fetchNextPage: result.fetchNextPage,
     hasNextPage: result.hasNextPage,
     isFetchingNextPage: result.isFetchingNextPage,
+  }
+}
+
+export function useArchivedSessionList() {
+  const result = useInfiniteQuery(listArchivedSessionsMetaQueryOptions)
+  const archivedSessionMetaList = useMemo(() => result.data?.pages.flatMap((p) => p.items), [result.data])
+  return {
+    archivedSessionMetaList,
+    refetch: result.refetch,
+    fetchNextPage: result.fetchNextPage,
+    hasNextPage: result.hasNextPage,
+    isFetchingNextPage: result.isFetchingNextPage,
+    isLoading: result.isLoading,
   }
 }
 
@@ -144,6 +217,34 @@ export async function refreshSessionListCache() {
   queryClient.setQueryData<InfiniteSessionData>(QueryKeys.ChatSessionsList, {
     pages: [firstPage],
     pageParams: [0],
+  })
+}
+
+async function refreshArchivedSessionListCache() {
+  const firstPage = await _listArchivedSessionsMetaPage(0)
+  queryClient.setQueryData<InfiniteSessionData>(QueryKeys.ArchivedChatSessionsList, {
+    pages: [firstPage],
+    pageParams: [0],
+  })
+}
+
+function updateArchivedSessionListData(updater: (items: SessionMetaRecord[]) => SessionMetaRecord[]) {
+  queryClient.setQueryData<InfiniteSessionData>(QueryKeys.ArchivedChatSessionsList, (old) => {
+    if (!old || !old.pages.length) return old
+    const allItems = old.pages.flatMap((p) => p.items)
+    const updated = updater(allItems)
+    const lastPage = old.pages[old.pages.length - 1]
+    const delta = updated.length - allItems.length
+    return {
+      pages: [
+        {
+          items: updated,
+          nextCursor: lastPage.nextCursor !== null ? lastPage.nextCursor + delta : null,
+          total: (lastPage.total || 0) + delta,
+        },
+      ],
+      pageParams: [0],
+    }
   })
 }
 
@@ -184,9 +285,19 @@ export function useSession(sessionId: string | null) {
   return { session, ...rest }
 }
 
-function _setSessionCache(sessionId: string, updated: Session | null) {
+function _setSessionCache(
+  sessionId: string,
+  updated: Session | null,
+  options?: { preserveCachedGeneratingMessages?: boolean }
+) {
   // 1. update session cache 2. session settings do not use cache now
-  queryClient.setQueryData(QueryKeys.ChatSession(sessionId), updated)
+  if (!options?.preserveCachedGeneratingMessages || !updated) {
+    queryClient.setQueryData(QueryKeys.ChatSession(sessionId), updated)
+    return
+  }
+  queryClient.setQueryData(QueryKeys.ChatSession(sessionId), (cached: Session | null | undefined) =>
+    mergeCachedGeneratingMessages(updated, cached)
+  )
 }
 
 async function runInChunks<T>(items: T[], chunkSize: number, worker: (item: T) => Promise<void>) {
@@ -228,6 +339,7 @@ export async function createSession(newSession: Omit<Session, 'id'>, previousId?
     createdAt: Date.now(),
   }
   await metaStorage.create(record)
+  _setSessionCache(session.id, session)
 
   updateSessionListData((items) => sortSessionRecords([...items, record]))
 
@@ -236,7 +348,11 @@ export async function createSession(newSession: Omit<Session, 'id'>, previousId?
 
 const sessionUpdateQueues: Record<string, UpdateQueue<Session>> = {}
 
-export async function updateSessionWithMessages(sessionId: string, updater: Updater<Session>) {
+export async function updateSessionWithMessages(
+  sessionId: string,
+  updater: Updater<Session>,
+  options?: { preserveCachedGeneratingMessages?: boolean }
+) {
   if (!sessionUpdateQueues[sessionId]) {
     // do not use await here to avoid data race
     sessionUpdateQueues[sessionId] = new UpdateQueue<Session>(
@@ -271,22 +387,27 @@ export async function updateSessionWithMessages(sessionId: string, updater: Upda
       sortSessionRecords(items.map((s) => (s.id === sessionId ? { ...s, ...newMeta } : s)))
     )
   }
-  _setSessionCache(sessionId, updated)
+  _setSessionCache(sessionId, updated, options)
   return updated
 }
 
 // 这里只能修改messages之外的字段
-export async function updateSession(sessionId: string, updater: Updater<Omit<Session, 'messages'>>) {
-  return await updateSessionWithMessages(sessionId, (session) => {
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`)
-    }
-    const updated = typeof updater === 'function' ? updater(session) : updater
-    return {
-      ...session,
-      ...updated,
-    }
-  })
+export async function updateSession(sessionId: string, updater: Updater<SessionMetadataUpdate>) {
+  return await updateSessionWithMessages(
+    sessionId,
+    (session) => {
+      if (!session) {
+        throw new Error(`Session ${sessionId} not found`)
+      }
+      const updated = typeof updater === 'function' ? updater(getSessionMetadataSnapshot(session)) : updater
+      assertNoMessageDataUpdate(updated)
+      return {
+        ...session,
+        ...updated,
+      }
+    },
+    { preserveCachedGeneratingMessages: true }
+  )
 }
 
 // only update session cache without touching storage, for performance sensitive usage
@@ -295,6 +416,10 @@ export async function updateSessionCache(sessionId: string, updater: Updater<Ses
   if (!session) {
     throw new Error(`Session ${sessionId} not found`)
   }
+  updateSessionCacheSync(sessionId, updater)
+}
+
+export function updateSessionCacheSync(sessionId: string, updater: Updater<Session>) {
   queryClient.setQueryData(QueryKeys.ChatSession(sessionId), (old: Session | undefined | null) => {
     if (!old) {
       return old
@@ -307,60 +432,129 @@ export async function updateSessionCache(sessionId: string, updater: Updater<Ses
   })
 }
 
-export async function deleteSession(id: string) {
-  console.debug('chatStore', 'deleteSession', id)
-  if (platform.type === 'desktop') {
+/**
+ * If a session has persisted download artifacts, ask the user to confirm deletion, since
+ * those downloadable files will be permanently removed along with the session. Returns
+ * false if the user cancels; true otherwise (including when there are no artifacts).
+ */
+export async function confirmSessionDeletion(id: string): Promise<boolean> {
+  if (platform.type !== 'desktop' || !platform.sandboxHasArtifacts) return true
+  try {
+    const { has } = await platform.sandboxHasArtifacts({ sessionId: id })
+    if (!has) return true
+    const confirmed = await NiceModal.show('confirm', {
+      title: i18n.t('Delete this chat?'),
+      message: i18n.t(
+        'This chat has downloadable files generated in the sandbox. Deleting it will permanently remove those files.'
+      ),
+      confirmText: i18n.t('Delete'),
+      danger: true,
+    })
+    return confirmed === true
+  } catch {
+    return true
+  }
+}
+
+async function cleanupSessionAttachmentRagEntries(ids: string[], operation: string) {
+  if (platform.type !== 'desktop') {
+    return
+  }
+  await runInChunks(ids, 10, async (id) => {
     try {
       await platform.getSessionAttachmentRagController().deleteSessionAttachments(id)
     } catch (error) {
-      console.warn('Failed to cleanup session attachment RAG entries for session deletion:', error)
+      console.warn(`Failed to cleanup session attachment RAG entries for ${operation}:`, error)
     }
-  }
-  await storage.removeItem(StorageKeyGenerator.session(id))
+  })
+}
+
+function cleanupDeletedSessionRuntimeState(id: string) {
   _setSessionCache(id, null)
+  uiStore.getState().clearSessionWebBrowsing(id)
+  uiStore.getState().removeSessionKnowledgeBase(id)
+  uiStore.getState().clearSessionAgentMode(id)
+  cleanupSessionAtomCache(id)
+  clearScrollPositionCache(id)
+  clearSessionActivity(id)
+  delete sessionUpdateQueues[id]
+  // Remove persisted download artifacts so deleted session references do not leak files on disk.
+  platform.sandboxReset?.({ sessionId: id }).catch(() => {})
+  platform.sandboxRemoveArtifacts?.({ sessionId: id }).catch(() => {})
+}
+
+export async function deleteSession(id: string) {
+  console.debug('chatStore', 'deleteSession', id)
+  await cleanupSessionAttachmentRagEntries([id], 'session deletion')
+  await storage.removeItem(StorageKeyGenerator.session(id))
   const metaStorage = await getMetaStorage()
   await metaStorage.delete(id)
   updateSessionListData((items) => items.filter((session) => session.id !== id))
-  // Clean up UI state and caches to prevent memory leaks
-  uiStore.getState().clearSessionWebBrowsing(id)
-  uiStore.getState().removeSessionKnowledgeBase(id)
-  cleanupSessionAtomCache(id)
-  clearScrollPositionCache(id)
-  delete sessionUpdateQueues[id]
+  updateArchivedSessionListData((items) => items.filter((session) => session.id !== id))
+  cleanupDeletedSessionRuntimeState(id)
+}
+
+export async function archiveSession(id: string) {
+  await updateSession(id, { hidden: true, archivedAt: Date.now() })
+  await refreshArchivedSessionListCache()
+}
+
+// 这里刻意逐个走 updateSession，保证完整 session 存储和 meta 存储一致。
+// 该实现不针对超大批量归档做性能优化。
+export async function archiveSessions(ids: string[]) {
+  const uniqueIds = [...new Set(ids)]
+  if (uniqueIds.length === 0) return
+
+  const archivedAt = Date.now()
+  const missingSessionIds: string[] = []
+  await runInChunks(uniqueIds, 20, async (id) => {
+    try {
+      await updateSession(id, { hidden: true, archivedAt })
+    } catch (error) {
+      if (error instanceof Error && error.message === `Session ${id} not found`) {
+        missingSessionIds.push(id)
+        return
+      }
+      throw error
+    }
+  })
+
+  if (missingSessionIds.length > 0) {
+    await cleanupSessionAttachmentRagEntries(missingSessionIds, 'stale session meta cleanup')
+    const metaStorage = await getMetaStorage()
+    await metaStorage.deleteMany(missingSessionIds)
+    for (const id of missingSessionIds) {
+      cleanupDeletedSessionRuntimeState(id)
+    }
+  }
+
+  await refreshSessionListCache()
+  await refreshArchivedSessionListCache()
+}
+
+export async function restoreSession(id: string) {
+  await updateSession(id, { hidden: false, archivedAt: undefined })
+  await refreshSessionListCache()
+  updateArchivedSessionListData((items) => items.filter((session) => session.id !== id))
 }
 
 export async function deleteSessions(ids: string[]) {
   const uniqueIds = [...new Set(ids)]
   if (uniqueIds.length === 0) return
 
-  if (platform.type === 'desktop') {
-    await runInChunks(uniqueIds, 10, async (id) => {
-      try {
-        await platform.getSessionAttachmentRagController().deleteSessionAttachments(id)
-      } catch (error) {
-        console.warn('Failed to cleanup session attachment RAG entries for session deletion:', error)
-      }
-    })
-  }
+  await cleanupSessionAttachmentRagEntries(uniqueIds, 'session deletion')
 
   await runInChunks(uniqueIds, 20, async (id) => {
     await storage.removeItem(StorageKeyGenerator.session(id))
   })
 
-  for (const id of uniqueIds) {
-    _setSessionCache(id, null)
-  }
-
   const metaStorage = await getMetaStorage()
   await metaStorage.deleteMany(uniqueIds)
   await refreshSessionListCache()
+  updateArchivedSessionListData((items) => items.filter((session) => !uniqueIds.includes(session.id)))
 
   for (const id of uniqueIds) {
-    uiStore.getState().clearSessionWebBrowsing(id)
-    uiStore.getState().removeSessionKnowledgeBase(id)
-    cleanupSessionAtomCache(id)
-    clearScrollPositionCache(id)
-    delete sessionUpdateQueues[id]
+    cleanupDeletedSessionRuntimeState(id)
   }
 }
 
@@ -425,17 +619,25 @@ export async function insertMessage(sessionId: string, message: Message, previou
     }
 
     if (previousId) {
+      // Insert after the previous message, skipping any compaction summaries
+      // anchored to it: a summary sits immediately after its boundary message
+      // and nothing may come between the pair (see buildCompactionCommitPatch).
+      const afterAnchoredSummaries = (messages: Message[], previousIndex: number): number => {
+        let index = previousIndex + 1
+        while (index < messages.length && messages[index].isSummary) {
+          index += 1
+        }
+        return index
+      }
+
       // try to find insert position in message list
       let previousIndex = session.messages.findIndex((m) => m.id === previousId)
 
       if (previousIndex >= 0) {
+        const insertIndex = afterAnchoredSummaries(session.messages, previousIndex)
         return {
           ...session,
-          messages: [
-            ...session.messages.slice(0, previousIndex + 1),
-            message,
-            ...session.messages.slice(previousIndex + 1),
-          ],
+          messages: [...session.messages.slice(0, insertIndex), message, ...session.messages.slice(insertIndex)],
         } satisfies Session
       }
 
@@ -444,6 +646,7 @@ export async function insertMessage(sessionId: string, message: Message, previou
         for (const thread of session.threads) {
           previousIndex = thread.messages.findIndex((m) => m.id === previousId)
           if (previousIndex >= 0) {
+            const insertIndex = afterAnchoredSummaries(thread.messages, previousIndex)
             return {
               ...session,
               threads: session.threads.map((th) => {
@@ -451,9 +654,9 @@ export async function insertMessage(sessionId: string, message: Message, previou
                   return {
                     ...thread,
                     messages: [
-                      ...thread.messages.slice(0, previousIndex + 1),
+                      ...thread.messages.slice(0, insertIndex),
                       message,
-                      ...thread.messages.slice(previousIndex + 1),
+                      ...thread.messages.slice(insertIndex),
                     ],
                   }
                 }
@@ -495,9 +698,7 @@ export async function updateMessage(
   updater: Updater<Message>,
   onlyUpdateCache?: boolean
 ) {
-  const updateFn = onlyUpdateCache ? updateSessionCache : updateSessionWithMessages
-
-  await updateFn(sessionId, (session) => {
+  const update = (session: Session | null | undefined): Session => {
     if (!session) {
       throw new Error(`session ${sessionId} not found`)
     }
@@ -543,47 +744,133 @@ export async function updateMessage(
       }
     }
 
+    if (session.messageForksHash) {
+      for (const [forkMessageId, fork] of Object.entries(session.messageForksHash)) {
+        const listIndex = fork.lists.findIndex((list) => list.messages.some((message) => message.id === messageId))
+        if (listIndex < 0) {
+          continue
+        }
+
+        return {
+          ...session,
+          messageForksHash: {
+            ...session.messageForksHash,
+            [forkMessageId]: {
+              ...fork,
+              lists: fork.lists.map((list, index) =>
+                index === listIndex
+                  ? {
+                      ...list,
+                      messages: updateMessages(list.messages),
+                    }
+                  : list
+              ),
+            },
+          },
+        } satisfies Session
+      }
+    }
+
     return session
-  })
+  }
+
+  if (onlyUpdateCache) {
+    await updateSessionCache(sessionId, update)
+    return
+  }
+
+  await updateSessionWithMessages(sessionId, update, { preserveCachedGeneratingMessages: true })
 }
 
 export async function removeMessage(sessionId: string, messageId: string) {
-  return await updateSessionWithMessages(sessionId, (session) => {
-    if (!session) {
-      throw new Error(`session ${sessionId} not found`)
+  // Messages can be deleted while other replies stream; their cache-only chunk
+  // updates must survive this full-session write. Preserving never resurrects
+  // the removed message: the merge only maps over messages that still exist.
+  return await updateSessionWithMessages(
+    sessionId,
+    (session) => {
+      if (!session) {
+        throw new Error(`session ${sessionId} not found`)
+      }
+
+      const messageToDelete =
+        session.messages.find((m) => m.id === messageId) ??
+        session.threads?.flatMap((thread) => thread.messages).find((m) => m.id === messageId) ??
+        Object.values(session.messageForksHash ?? {})
+          .flatMap((fork) => fork.lists)
+          .flatMap((list) => list.messages)
+          .find((m) => m.id === messageId)
+      const isSummaryMessage = messageToDelete?.isSummary === true
+
+      const newMessages = session.messages.filter((m) => m.id !== messageId)
+      const newThreads = session.threads?.map((thread) => ({
+        ...thread,
+        messages: thread.messages.filter((m) => m.id !== messageId),
+        compactionPoints: isSummaryMessage
+          ? thread.compactionPoints?.filter((cp) => cp.summaryMessageId !== messageId)
+          : thread.compactionPoints,
+      }))
+
+      const newCompactionPoints = isSummaryMessage
+        ? session.compactionPoints?.filter((cp) => cp.summaryMessageId !== messageId)
+        : session.compactionPoints
+
+      // Clean up empty fork branches after message removal and auto-switch if needed
+      const { messages: finalMessages, messageForksHash: newMessageForksHash } = cleanupEmptyForkBranches(
+        removeMessageFromSavedForks(session.messageForksHash, messageId),
+        newMessages,
+        newThreads
+      )
+
+      return {
+        ...session,
+        messages: finalMessages,
+        threads: newThreads,
+        messageForksHash: newMessageForksHash,
+        compactionPoints: newCompactionPoints,
+      }
+    },
+    { preserveCachedGeneratingMessages: true }
+  )
+}
+
+function removeMessageFromSavedForks(
+  messageForksHash: Session['messageForksHash'],
+  messageId: string
+): Session['messageForksHash'] {
+  if (!messageForksHash) {
+    return undefined
+  }
+
+  const nextHash: NonNullable<Session['messageForksHash']> = {}
+  for (const [forkMessageId, fork] of Object.entries(messageForksHash)) {
+    const removedListIndex = fork.lists.findIndex((list) => list.messages.some((message) => message.id === messageId))
+    if (removedListIndex < 0) {
+      nextHash[forkMessageId] = fork
+      continue
     }
 
-    const messageToDelete = session.messages.find((m) => m.id === messageId)
-    const isSummaryMessage = messageToDelete?.isSummary === true
+    const removedBranchBecomesEmpty =
+      removedListIndex !== fork.position && fork.lists[removedListIndex].messages.length === 1
+    const updatedLists = fork.lists
+      .map((list) => ({
+        ...list,
+        messages: list.messages.filter((message) => message.id !== messageId),
+      }))
+      .filter((list, index) => index === fork.position || list.messages.length > 0)
 
-    const newMessages = session.messages.filter((m) => m.id !== messageId)
-    const newThreads = session.threads?.map((thread) => ({
-      ...thread,
-      messages: thread.messages.filter((m) => m.id !== messageId),
-      compactionPoints: isSummaryMessage
-        ? thread.compactionPoints?.filter((cp) => cp.summaryMessageId !== messageId)
-        : thread.compactionPoints,
-    }))
-
-    const newCompactionPoints = isSummaryMessage
-      ? session.compactionPoints?.filter((cp) => cp.summaryMessageId !== messageId)
-      : session.compactionPoints
-
-    // Clean up empty fork branches after message removal and auto-switch if needed
-    const { messages: finalMessages, messageForksHash: newMessageForksHash } = cleanupEmptyForkBranches(
-      session.messageForksHash,
-      newMessages,
-      newThreads
-    )
-
-    return {
-      ...session,
-      messages: finalMessages,
-      threads: newThreads,
-      messageForksHash: newMessageForksHash,
-      compactionPoints: newCompactionPoints,
+    if (updatedLists.length <= 1) {
+      continue
     }
-  })
+
+    nextHash[forkMessageId] = {
+      ...fork,
+      position: removedBranchBecomesEmpty && removedListIndex < fork.position ? fork.position - 1 : fork.position,
+      lists: updatedLists,
+    }
+  }
+
+  return Object.keys(nextHash).length > 0 ? nextHash : undefined
 }
 
 /**
@@ -701,7 +988,9 @@ export async function recoverSessionList() {
   for (const key of sessionKeys) {
     try {
       const session = await storage.getItem<Session | null>(key, null)
-      if (session) {
+      // Skip junk session entries (e.g. empty `{}` objects or `session:undefined`)
+      // that have no id — they cannot become valid meta records.
+      if (session && session.id) {
         const migratedSession = migrateSession(session)
         const firstMessageTimestamp = migratedSession.messages[0]?.timestamp || 0
         sessionsWithTimestamp.push({

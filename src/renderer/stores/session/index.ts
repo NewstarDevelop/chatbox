@@ -4,16 +4,24 @@
  * This module provides all session-related operations for Chatbox.
  * Internal helpers (prefixed with _) are intentionally not exported.
  *
- * Public exports: 40 functions + types + state
+ * Public exports: 41 functions + types + state
  * - CRUD (8): Session lifecycle operations
  * - Messages (5): Message CRUD and user input handling
  * - Threads (9): Thread/history management
- * - Forks (5): Message branching operations
+ * - Forks (6): Message branching operations
  * - Generation (8): AI generation orchestration
  * - Naming (4): Session/thread naming
  * - Export (1): Export functionality
  */
 
+export {
+  createDefaultAgentModeEntry,
+  getSessionAgentModeEntry,
+  getSessionAgentModeFromSession,
+  lockSessionAgentMode,
+  setSessionAgentMode,
+  useSessionAgentMode,
+} from './agent-mode'
 export { createAttachmentResolver } from './attachment-resolver'
 // CRUD operations (8 functions)
 export {
@@ -28,8 +36,8 @@ export {
 } from './crud'
 // Export operations (1 function)
 export { exportSessionChat } from './export'
-// Fork operations (5 functions)
-export { createNewFork, deleteFork, expandFork, findMessageLocation, switchFork } from './forks'
+// Fork operations (6 functions)
+export { createNewFork, deleteFork, expandFork, findMessageLocation, switchFork, switchForkTo } from './forks'
 // Generation operations (8 functions)
 export {
   generate,
@@ -40,6 +48,9 @@ export {
   getSessionWebBrowsing,
   regenerateInNewFork,
 } from './generation'
+export type { GenerationCancellationPersistence } from './generation-cancellation'
+export { stopGeneratingMessages } from './generation-cancellation'
+export { hasSuccessfulUserAssistantTurn, isSuccessfulAssistantReply } from './message-success'
 // Message operations (5 functions)
 export {
   insertMessage,
@@ -59,7 +70,14 @@ export {
 } from './naming'
 export { getOCRModel, ocrImagesInMessages } from './ocr-helper'
 // Orchestration and AI helpers
-export { orchestrateGeneration } from './orchestration'
+export {
+  continuePausedToolCall,
+  disableToolCallLimitPauseAndContinue,
+  isRetryableToolCallStep,
+  orchestrateGeneration,
+  retryFromLastToolCallAfterApiError,
+  stopPausedToolCall,
+} from './orchestration'
 export { createLoadingPictures } from './pictures'
 // Thread operations (9 functions)
 export {

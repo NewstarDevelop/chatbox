@@ -1,6 +1,7 @@
 import { ActionIcon, Box, Flex, Indicator, Stack, Text } from '@mantine/core'
 import {
   IconAdjustmentsHorizontal,
+  IconArchive,
   IconBook,
   IconBox,
   IconCategory,
@@ -71,6 +72,7 @@ const ITEMS = [
         {
           key: 'skills',
           label: 'Skills',
+          noTranslate: true,
           icon: <IconWand className="w-full h-full" />,
         },
       ]
@@ -84,6 +86,11 @@ const ITEMS = [
     key: 'chat',
     label: 'Chat Settings',
     icon: <IconMessages className="w-full h-full" />,
+  },
+  {
+    key: 'archive',
+    label: 'Archived Chats',
+    icon: <IconArchive className="w-full h-full" />,
   },
   ...(platform.type === 'mobile'
     ? []
@@ -130,12 +137,7 @@ export function RouteComponent() {
       }
     >
       <SettingsRoot />
-      <Toaster
-        richColors
-        position="bottom-center"
-        style={{ zIndex: 2147483647 }}
-        toastOptions={{ style: { zIndex: 2147483647 } }}
-      />
+      <Toaster richColors position="bottom-center" style={{ zIndex: 2147483647 }} />
     </Page>
   )
 }
@@ -180,7 +182,7 @@ export function SettingsRoot() {
                 c={item.key === key ? 'chatbox-brand' : 'chatbox-secondary'}
                 bg={item.key === key ? 'var(--chatbox-background-brand-secondary)' : 'transparent'}
                 className={clsx(
-                  ' cursor-pointer select-none rounded-md',
+                  ' cursor-pointer select-none rounded-lg',
                   item.key === key ? '' : 'hover:!bg-chatbox-background-gray-secondary'
                 )}
               >
@@ -193,7 +195,7 @@ export function SettingsRoot() {
                   span={true}
                   className={`!text-inherit ${isSmallScreen ? 'min-h-[32px] leading-[32px]' : ''}`}
                 >
-                  {t(item.label)}
+                  {'noTranslate' in item && item.noTranslate ? item.label : t(item.label)}
                 </Text>
                 {item.key === 'chatbox-ai' && isChatboxAIActivated && (
                   <Indicator size={8} color="chatbox-success" className="ml-auto" />
@@ -217,7 +219,7 @@ export function SettingsRoot() {
                 py="sm"
                 align="center"
                 c={'chatbox-secondary'}
-                className={clsx(' cursor-pointer select-none rounded-md')}
+                className={clsx(' cursor-pointer select-none rounded-lg')}
               >
                 <Box component="span" flex="0 0 auto" w={20} h={20} mr="xs">
                   <ScalableIcon icon={IconInfoCircle} size={20} />

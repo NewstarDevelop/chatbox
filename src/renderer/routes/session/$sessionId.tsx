@@ -1,27 +1,42 @@
 import NiceModal from '@ebay/nice-modal-react'
-import { Stack, Box, Button } from '@mantine/core'
-import type { Message, ModelProvider } from '@shared/types'
+import { Box, Button } from '@mantine/core'
+import type { ModelProvider } from '@shared/types'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useStore } from 'zustand'
 import { JK_PAGE_NAMES } from '@/analytics/jk-events'
-import { ChatboxWelcomeCard } from '@/components/common/ChatboxWelcomeCard'
 import MessageList, { type MessageListRef } from '@/components/chat/MessageList'
+import PendingApprovalPill from '@/components/chat/PendingApprovalPill'
+import { ChatboxWelcomeCard } from '@/components/common/ChatboxWelcomeCard'
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
-import InputBox from '@/components/InputBox/InputBox'
+import InputBox, { type InputBoxPayload } from '@/components/InputBox/InputBox'
 import Header from '@/components/layout/Header'
 import Page from '@/components/layout/Page'
-import { useProviders } from '@/hooks/useProviders'
-import { defaultSessionsForCN, defaultSessionsForEN } from '@/packages/initial_data'
 import ThreadHistoryDrawer from '@/components/session/ThreadHistoryDrawer'
+import { useProviders } from '@/hooks/useProviders'
+import { useIsSmallScreen } from '@/hooks/useScreenChange'
+import useVersion from '@/hooks/useVersion'
+import { defaultSessionsForCN, defaultSessionsForEN } from '@/packages/initial_data'
 import * as remote from '@/packages/remote'
 import { useAuthInfoStore } from '@/stores/authInfoStore'
 import { updateSession as updateSessionStore, useSession } from '@/stores/chatStore'
+import { applyChatboxLicenseDefaultModelToSession } from '@/stores/defaultChatModel'
 import { lastUsedModelStore } from '@/stores/lastUsedModelStore'
 import * as scrollActions from '@/stores/scrollActions'
-import { modifyMessage, removeCurrentThread, startNewThread, submitNewUserMessage } from '@/stores/sessionActions'
-import { getAllMessageList } from '@/stores/sessionHelpers'
+import {
+  countCancellableGeneratingAssistantMessages,
+  getGenerationControlMessages,
+} from '@/stores/session/generation-state'
+import {
+  modifyMessage,
+  removeCurrentThread,
+  removeMessage,
+  startNewThread,
+  stopGeneratingMessages,
+  submitNewUserMessage,
+} from '@/stores/sessionActions'
+import { clearSessionActivity } from '@/stores/sessionActivityStore'
 import { useSettingsStore } from '@/stores/settingsStore'
 import { useUIStore } from '@/stores/uiStore'
 import { getHomeWelcomeCardMode } from '@/utils/homeWelcomeCard'
@@ -40,25 +55,59 @@ function RouteComponent() {
   const navigate = useNavigate()
   const { session: currentSession, isFetching } = useSession(currentSessionId)
   const { providers } = useProviders()
-  const hasLicense = useSettingsStore((s) => Boolean(s.licenseKey))
+  const licenseKey = useSettingsStore((s) => s.licenseKey)
+  const hasLicense = Boolean(licenseKey)
+  const licenseDetail = useSettingsStore((s) => s.licenseDetail)
+  const licensePlanName = useSettingsStore((s) => s.licensePlanName)
   const hasExpiredLicense = useSettingsStore((s) => s.hasExpiredLicense)
   const isLoggedIn = useAuthInfoStore((s) => Boolean(s.accessToken && s.refreshToken))
+  const { isExceeded, isExceededResolved } = useVersion()
   const widthFull = useUIStore((s) => s.widthFull)
+  const isSmallScreen = useIsSmallScreen()
   const setLastUsedChatModel = useStore(lastUsedModelStore, (state) => state.setChatModel)
   const setLastUsedPictureModel = useStore(lastUsedModelStore, (state) => state.setPictureModel)
+
+  useEffect(() => {
+    clearSessionActivity(currentSessionId)
+  }, [currentSessionId])
   const welcomeCardMode = useMemo(
-    () => getHomeWelcomeCardMode({ providerCount: providers.length, isLoggedIn, hasLicense, hasExpiredLicense }),
-    [providers.length, isLoggedIn, hasLicense, hasExpiredLicense]
+    () =>
+      getHomeWelcomeCardMode({
+        providerCount: providers.length,
+        isLoggedIn,
+        hasLicense,
+        hasExpiredLicense,
+        hideForStoreReview: isExceeded || !isExceededResolved,
+      }),
+    [providers.length, isLoggedIn, hasLicense, hasExpiredLicense, isExceeded, isExceededResolved]
   )
 
-  const currentMessageList = useMemo(() => (currentSession ? getAllMessageList(currentSession) : []), [currentSession])
+  const generationControlMessages = useMemo(
+    () => (currentSession ? getGenerationControlMessages(currentSession) : []),
+    [currentSession]
+  )
   const shouldShowTemplateWelcomeCard = useMemo(
     () => Boolean(currentSession && builtInTemplateSessionIds.has(currentSession.id) && welcomeCardMode !== 'none'),
     [currentSession, welcomeCardMode]
   )
-  const lastGeneratingMessage = useMemo(
-    () => currentMessageList.find((m: Message) => m.generating),
-    [currentMessageList]
+  const currentSessionWithDefaultModel = useMemo(() => {
+    if (!currentSession || !builtInTemplateSessionIds.has(currentSession.id)) {
+      return currentSession
+    }
+    return applyChatboxLicenseDefaultModelToSession(currentSession, {
+      licenseKey,
+      hasExpiredLicense,
+      licenseDetail,
+      licensePlanName,
+    })
+  }, [currentSession, hasExpiredLicense, licenseDetail, licenseKey, licensePlanName])
+  const generatingMessages = useMemo(
+    () => generationControlMessages.filter((message) => message.generating),
+    [generationControlMessages]
+  )
+  const cancellableGeneratingReplyCount = useMemo(
+    () => countCancellableGeneratingAssistantMessages(generationControlMessages),
+    [generationControlMessages]
   )
 
   const messageListRef = useRef<MessageListRef>(null)
@@ -90,6 +139,15 @@ function RouteComponent() {
       }
     }
   }, [currentSession?.settings, currentSession?.type, currentSession, setLastUsedChatModel, setLastUsedPictureModel])
+
+  useEffect(() => {
+    if (!currentSession || !currentSessionWithDefaultModel || currentSessionWithDefaultModel === currentSession) {
+      return
+    }
+    void updateSessionStore(currentSession.id, {
+      settings: currentSessionWithDefaultModel.settings,
+    })
+  }, [currentSession, currentSessionWithDefaultModel])
 
   const onSelectModel = useCallback(
     (provider: ModelProvider, modelId: string) => {
@@ -129,19 +187,16 @@ function RouteComponent() {
   }, [currentSession])
 
   const onSubmit = useCallback(
-    async ({
-      constructedMessage,
-      needGenerating = true,
-      onUserMessageReady,
-    }: {
-      constructedMessage: Message
-      needGenerating?: boolean
-      onUserMessageReady?: () => void
-    }) => {
+    async ({ constructedMessage, needGenerating = true, onUserMessageReady }: InputBoxPayload) => {
       messageListRef.current?.setIsNewMessage(true)
 
       if (!currentSession) {
         return
+      }
+      if (currentSessionWithDefaultModel && currentSessionWithDefaultModel !== currentSession) {
+        await updateSessionStore(currentSession.id, {
+          settings: currentSessionWithDefaultModel.settings,
+        })
       }
       messageListRef.current?.scrollToBottom('instant')
 
@@ -157,7 +212,7 @@ function RouteComponent() {
         onUserMessageReady,
       })
     },
-    [currentSession]
+    [currentSession, currentSessionWithDefaultModel]
   )
 
   const onClickSessionSettings = useCallback(() => {
@@ -174,29 +229,34 @@ function RouteComponent() {
     if (!currentSession) {
       return false
     }
-    if (lastGeneratingMessage?.generating) {
-      lastGeneratingMessage?.cancel?.()
-      void modifyMessage(currentSession.id, { ...lastGeneratingMessage, generating: false }, true)
-    }
+    void stopGeneratingMessages(currentSession.id, generatingMessages, {
+      removeMessage,
+      persistMessage: (sessionId, message) => modifyMessage(sessionId, message, true),
+    })
     return true
-  }, [currentSession, lastGeneratingMessage])
+  }, [currentSession, generatingMessages])
 
   const model = useMemo(() => {
-    if (!currentSession?.settings?.modelId || !currentSession?.settings?.provider) {
+    if (!currentSessionWithDefaultModel?.settings?.modelId || !currentSessionWithDefaultModel?.settings?.provider) {
       return undefined
     }
     return {
-      provider: currentSession.settings.provider,
-      modelId: currentSession.settings.modelId,
+      provider: currentSessionWithDefaultModel.settings.provider,
+      modelId: currentSessionWithDefaultModel.settings.modelId,
     }
-  }, [currentSession?.settings?.provider, currentSession?.settings?.modelId])
+  }, [currentSessionWithDefaultModel?.settings?.provider, currentSessionWithDefaultModel?.settings?.modelId])
 
   return currentSession ? (
-    <div className="flex flex-col h-full">
+    <div className={`flex flex-col h-full ${!isSmallScreen ? 'relative' : ''}`}>
       <Header session={currentSession} />
 
       {/* MessageList 设置 key，确保每个 session 对应新的 MessageList 实例 */}
-      <MessageList ref={messageListRef} key={`message-list${currentSessionId}`} currentSession={currentSession} />
+      <MessageList
+        ref={messageListRef}
+        key={`message-list${currentSessionId}`}
+        currentSession={currentSession}
+        className={!isSmallScreen ? 'pt-[2px]' : undefined}
+      />
 
       <Box className="relative">
         {shouldShowTemplateWelcomeCard && (
@@ -213,6 +273,13 @@ function RouteComponent() {
           </Box>
         )}
 
+        {/* 悬浮审批胶囊：审批卡片滚出视口时出现在输入框上方 */}
+        <Box className="pointer-events-none absolute left-0 right-0 z-10" style={{ bottom: '100%' }} px="sm" mb="xs">
+          <ErrorBoundary name="session-approval-pill">
+            <PendingApprovalPill session={currentSession} />
+          </ErrorBoundary>
+        </Box>
+
         {/* <ScrollButtons /> */}
         <ErrorBoundary name="session-inputbox">
           <InputBox
@@ -224,7 +291,8 @@ function RouteComponent() {
             onRollbackThread={onRollbackThread}
             onSelectModel={onSelectModel}
             onClickSessionSettings={onClickSessionSettings}
-            generating={!!lastGeneratingMessage}
+            generating={generatingMessages.length > 0}
+            generatingCount={cancellableGeneratingReplyCount}
             onSubmit={onSubmit}
             onStopGenerating={onStopGenerating}
           />

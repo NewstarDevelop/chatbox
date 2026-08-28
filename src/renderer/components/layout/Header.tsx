@@ -1,17 +1,19 @@
 import NiceModal from '@ebay/nice-modal-react'
-import { ActionIcon, Badge, Flex, Text, Tooltip } from '@mantine/core'
+import { ActionIcon, Flex, Text } from '@mantine/core'
 import type { Session } from '@shared/types'
-import { IconLayoutSidebarLeftExpand, IconMenu2, IconPencil } from '@tabler/icons-react'
+import { IconLayoutSidebarLeftExpand, IconMenu2 } from '@tabler/icons-react'
 import clsx from 'clsx'
+import { PencilIcon } from 'lucide-react'
 import { useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import useNeedRoomForWinControls from '@/hooks/useNeedRoomForWinControls'
 import { useIsSmallScreen } from '@/hooks/useScreenChange'
 import { scheduleGenerateNameAndThreadName, scheduleGenerateThreadName } from '@/stores/sessionActions'
 import * as settingActions from '@/stores/settingActions'
 import { useUIStore } from '@/stores/uiStore'
 import Divider from '../common/Divider'
-import { ScalableIcon } from '../common/ScalableIcon'
+import { getAutoTitleGenerationAction } from './auto-title'
 import Toolbar from './Toolbar'
 import WindowControls from './WindowControls'
 
@@ -31,15 +33,10 @@ export default function Header(props: { session: Session }) {
       return
     }
 
-    const hasGeneratingMessage = currentSession.messages.some((msg) => msg.generating)
-
-    if (hasGeneratingMessage || currentSession.messages.length < 2) {
-      return
-    }
-
-    if (currentSession.name === 'Untitled') {
+    const action = getAutoTitleGenerationAction(currentSession)
+    if (action === 'session-and-thread') {
       scheduleGenerateNameAndThreadName(currentSession.id)
-    } else if (!currentSession.threadName) {
+    } else if (action === 'thread') {
       scheduleGenerateThreadName(currentSession.id)
     }
   }, [currentSession])
@@ -57,7 +54,7 @@ export default function Header(props: { session: Session }) {
         h={48}
         align="center"
         px="md"
-        className={clsx('flex-none title-bar', isSmallScreen ? 'bg-chatbox-background-primary' : '')}
+        className={clsx('flex-none title-bar border-0', isSmallScreen ? 'bg-chatbox-background-primary' : '')}
       >
         {(!showSidebar || isSmallScreen) && (
           <Flex align="center" className={needRoomForMacWindowControls ? 'pl-20' : ''}>
@@ -80,33 +77,24 @@ export default function Header(props: { session: Session }) {
           className="min-w-0"
           {...(isSmallScreen ? { justify: 'center', pl: 28, pr: 8 } : {})}
         >
-          <Text fw={600} size="18px" lineClamp={1}>
+          <Text fw={600} fz={18} lh="24px" truncate="end" className="min-w-0">
             {currentSession?.name}
           </Text>
-          {currentSession?.threadName && currentSession.threadName !== currentSession.name && (
-            <Badge
-              size="xs"
-              variant="light"
-              color="gray"
-              ml={6}
-              maw={180}
-              className="flex-shrink-0"
-              classNames={{ label: 'truncate' }}
-            >
-              {currentSession.threadName}
-            </Badge>
-          )}
-          <Tooltip label={t('Customize settings for the current conversation')}>
-            <ActionIcon
-              className="controls"
-              variant="subtle"
-              color="chatbox-tertiary"
-              size={isSmallScreen ? 20 : 16}
-              ml={4}
-              onClick={editCurrentSession}
-            >
-              <ScalableIcon icon={IconPencil} size={14} />
-            </ActionIcon>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <ActionIcon
+                className="controls"
+                variant="subtle"
+                color="chatbox-tertiary"
+                size={isSmallScreen ? 20 : 16}
+                ml={4}
+                aria-label={t('Customize settings for the current conversation')}
+                onClick={editCurrentSession}
+              >
+                <PencilIcon size={12} />
+              </ActionIcon>
+            </TooltipTrigger>
+            <TooltipContent>{t('Customize settings for the current conversation')}</TooltipContent>
           </Tooltip>
         </Flex>
 
@@ -115,7 +103,7 @@ export default function Header(props: { session: Session }) {
         <WindowControls className="-mr-3 ml-2" />
       </Flex>
 
-      <Divider />
+      {isSmallScreen && <Divider />}
     </>
   )
 }

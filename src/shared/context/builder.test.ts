@@ -31,6 +31,18 @@ describe('buildContext', () => {
       expect(result[0].id).toBe('1')
     })
 
+    it('should filter out fork marker messages', async () => {
+      const messages: Message[] = [
+        createMessage({ id: '1', role: 'user', contentParts: [{ type: 'text', text: 'Hi' }] }),
+        createMessage({ id: 'fork-marker', role: 'assistant', isForkMarker: true }),
+        createMessage({ id: '2', role: 'assistant', contentParts: [{ type: 'text', text: 'Hello' }] }),
+      ]
+
+      const result = await buildContext(messages, { attachmentResolver: createMockResolver() })
+
+      expect(result.map((m) => m.id)).toEqual(['1', '2'])
+    })
+
     it('should return empty array for empty messages', async () => {
       const result = await buildContext([], { attachmentResolver: createMockResolver() })
 
@@ -233,6 +245,50 @@ describe('buildContext', () => {
 
       expect(result[0].id).toBe('sys')
     })
+
+    it('should ignore a compaction point whose summary is missing from the path', async () => {
+      const compactionPoints: CompactionPoint[] = [
+        { boundaryMessageId: '2', summaryMessageId: 'missing-summary', createdAt: Date.now() },
+      ]
+
+      const messages: Message[] = [
+        createMessage({ id: '1', role: 'user' }),
+        createMessage({ id: '2', role: 'assistant' }),
+        createMessage({ id: '3', role: 'user' }),
+      ]
+
+      const result = await buildContext(messages, {
+        attachmentResolver: createMockResolver(),
+        compactionPoints,
+      })
+
+      expect(result.map((m) => m.id)).toEqual(['1', '2', '3'])
+    })
+
+    it('should fall back to an older applicable point when the latest is torn apart by a fork switch', async () => {
+      const now = Date.now()
+      const compactionPoints: CompactionPoint[] = [
+        { boundaryMessageId: '2', summaryMessageId: 'old-summary', createdAt: now - 1000 },
+        { boundaryMessageId: '4', summaryMessageId: 'new-summary', createdAt: now },
+      ]
+
+      // new-summary went into a sibling fork branch; this path only holds the older pair.
+      const messages: Message[] = [
+        createMessage({ id: '1', role: 'user' }),
+        createMessage({ id: '2', role: 'assistant' }),
+        createMessage({ id: 'old-summary', role: 'assistant', isSummary: true }),
+        createMessage({ id: '3', role: 'user' }),
+        createMessage({ id: '4', role: 'assistant' }),
+        createMessage({ id: '5', role: 'user' }),
+      ]
+
+      const result = await buildContext(messages, {
+        attachmentResolver: createMockResolver(),
+        compactionPoints,
+      })
+
+      expect(result.map((m) => m.id)).toEqual(['old-summary', '3', '4', '5'])
+    })
   })
 
   describe('tool call cleanup', () => {
@@ -277,6 +333,52 @@ describe('buildContext', () => {
 
       expect(msg2?.contentParts.some((p) => p.type === 'tool-call')).toBe(false)
       expect(msg6?.contentParts.some((p) => p.type === 'tool-call')).toBe(true)
+    })
+
+    it('should preserve tool calls for explicitly protected messages', async () => {
+      const messages: Message[] = [
+        createMessage({ id: '1', role: 'user' }),
+        createMessage({
+          id: '2',
+          role: 'assistant',
+          contentParts: [
+            { type: 'text', text: 'Tool call to preserve' },
+            { type: 'tool-call', state: 'result', toolCallId: 'tc1', toolName: 'search', args: {}, result: {} },
+          ],
+        }),
+        createMessage({ id: '3', role: 'user' }),
+        createMessage({
+          id: '4',
+          role: 'assistant',
+          contentParts: [
+            { type: 'text', text: 'Tool call to clean' },
+            { type: 'tool-call', state: 'result', toolCallId: 'tc2', toolName: 'search', args: {}, result: {} },
+          ],
+        }),
+        createMessage({ id: '5', role: 'user' }),
+        createMessage({
+          id: '6',
+          role: 'assistant',
+          contentParts: [
+            { type: 'text', text: 'Recent tool call' },
+            { type: 'tool-call', state: 'result', toolCallId: 'tc3', toolName: 'search', args: {}, result: {} },
+          ],
+        }),
+      ]
+
+      const result = await buildContext(messages, {
+        attachmentResolver: createMockResolver(),
+        keepToolCallRounds: 1,
+        preserveToolCallMessageIds: ['2'],
+      })
+
+      const preservedMessage = result.find((m) => m.id === '2')
+      const cleanedMessage = result.find((m) => m.id === '4')
+      const recentMessage = result.find((m) => m.id === '6')
+
+      expect(preservedMessage?.contentParts.some((p) => p.type === 'tool-call')).toBe(true)
+      expect(cleanedMessage?.contentParts.some((p) => p.type === 'tool-call')).toBe(false)
+      expect(recentMessage?.contentParts.some((p) => p.type === 'tool-call')).toBe(true)
     })
   })
 
@@ -421,6 +523,112 @@ describe('buildContext', () => {
       expect(text).toContain('query_session_attachment')
       expect(text).not.toContain('large parsed content should stay out of context')
     })
+
+    it('should use ATTACHMENT_FILE metadata tags in sandbox mode', async () => {
+      const resolver = createMockResolver(new Map([['file-key', 'parsed content should stay out of sandbox prompt']]))
+
+      const messages: Message[] = [
+        createMessage({
+          id: '1',
+          role: 'user',
+          contentParts: [{ type: 'text', text: 'Analyze the spreadsheet' }],
+          files: [
+            {
+              id: 'file-1',
+              name: 'budget.xlsx',
+              fileType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              storageKey: 'file-key',
+              rawStorageKey: 'file-key-raw',
+              parserType: 'local',
+              byteLength: 4096,
+            },
+          ],
+        }),
+      ]
+
+      const result = await buildContext(messages, { attachmentResolver: resolver, sandboxMode: true })
+
+      expect(resolver.read).not.toHaveBeenCalled()
+      const textContent = result[0].contentParts.find((p) => p.type === 'text')
+      const text = (textContent as { type: 'text'; text: string }).text
+      expect(text).toContain('<ATTACHMENT_FILE>')
+      expect(text).not.toContain('<ATTACHED_FILES>')
+      expect(text).toContain('<FILE_NAME>budget.xlsx</FILE_NAME>')
+      expect(text).toContain('<SANDBOX_MODE>true</SANDBOX_MODE>')
+      expect(text).toContain('<SANDBOX_PATH>budget.xlsx</SANDBOX_PATH>')
+      expect(text).toContain('<PARSED_SANDBOX_PATH>budget.xlsx_parsed.txt</PARSED_SANDBOX_PATH>')
+      expect(text).toContain('code_execution')
+      expect(text).not.toContain('parsed content should stay out of sandbox prompt')
+    })
+
+    it('should omit parsed sandbox path for raw-only sandbox files', async () => {
+      const resolver = createMockResolver(new Map())
+
+      const messages: Message[] = [
+        createMessage({
+          id: '1',
+          role: 'user',
+          contentParts: [{ type: 'text', text: 'Inspect this binary' }],
+          files: [
+            {
+              id: 'file-1',
+              name: 'archive.bin',
+              fileType: 'application/octet-stream',
+              storageKey: 'file-key',
+              rawStorageKey: 'file-key-raw',
+              parserType: 'sandbox-raw',
+            },
+          ],
+        }),
+      ]
+
+      const result = await buildContext(messages, { attachmentResolver: resolver, sandboxMode: true })
+
+      const textContent = result[0].contentParts.find((p) => p.type === 'text')
+      const text = (textContent as { type: 'text'; text: string }).text
+      expect(text).toContain('<SANDBOX_PATH>archive.bin</SANDBOX_PATH>')
+      expect(text).not.toContain('<PARSED_SANDBOX_PATH>')
+      expect(text).toContain('Use read_file or code_execution on SANDBOX_PATH')
+    })
+
+    it('should preserve session retrieval cues in sandbox mode', async () => {
+      const resolver = createMockResolver(new Map([['file-key', 'large parsed content should stay out of context']]))
+
+      const messages: Message[] = [
+        createMessage({
+          id: '1',
+          role: 'user',
+          contentParts: [{ type: 'text', text: 'Use the attached manual' }],
+          files: [
+            {
+              id: 'file-1',
+              name: 'manual.pdf',
+              fileType: 'application/pdf',
+              storageKey: 'file-key',
+              rawStorageKey: 'file-key-raw',
+              ragMode: 'session-retrieval',
+              sessionAttachmentId: 42,
+              sessionAttachmentIndexStatus: 'ready',
+            },
+          ],
+        }),
+      ]
+
+      const result = await buildContext(messages, { attachmentResolver: resolver, sandboxMode: true })
+
+      expect(resolver.read).not.toHaveBeenCalled()
+      const textContent = result[0].contentParts.find((p) => p.type === 'text')
+      const text = (textContent as { type: 'text'; text: string }).text
+      expect(text).toContain('<ATTACHMENT_FILE>')
+      expect(text).not.toContain('<ATTACHED_FILES>')
+      expect(text).toContain('<FILE_KEY>session-attachment:42</FILE_KEY>')
+      expect(text).toContain('<RETRIEVAL_MODE>session_attachment_rag</RETRIEVAL_MODE>')
+      expect(text).toContain('<INDEX_STATUS>ready</INDEX_STATUS>')
+      expect(text).toContain('<SANDBOX_PATH>manual.pdf</SANDBOX_PATH>')
+      expect(text).toContain('<PARSED_SANDBOX_PATH>manual.pdf_parsed.txt</PARSED_SANDBOX_PATH>')
+      expect(text).toContain('query_session_attachment')
+      expect(text).not.toContain('large parsed content should stay out of context')
+    })
   })
 
   describe('immutability', () => {
@@ -523,12 +731,9 @@ describe('buildContext', () => {
         compactionPoints,
       })
 
-      expect(result.map((m) => m.id)).toContain('sys')
-      expect(result.map((m) => m.id)).toContain('3')
-      expect(result.map((m) => m.id)).toContain('4')
-      expect(result.map((m) => m.id)).not.toContain('1')
-      expect(result.map((m) => m.id)).not.toContain('2')
-      expect(result.map((m) => m.id)).not.toContain('nonexistent-summary')
+      // The point is not applicable without its summary: keep full history
+      // instead of silently dropping everything before the boundary.
+      expect(result.map((m) => m.id)).toEqual(['sys', '1', '2', '3', '4'])
     })
 
     it('should handle system message not at index 0', async () => {

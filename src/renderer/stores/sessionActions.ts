@@ -13,7 +13,7 @@ export {
 // Re-export export operations from session/export.ts
 export { exportSessionChat } from './session/export'
 // Re-export fork operations from session/forks.ts
-export { createNewFork, deleteFork, expandFork, switchFork } from './session/forks'
+export { createNewFork, deleteFork, expandFork, switchFork, switchForkTo } from './session/forks'
 // Re-export generation operations from session module
 export {
   generate,
@@ -24,6 +24,7 @@ export {
   getSessionWebBrowsing,
   regenerateInNewFork,
 } from './session/generation'
+export { stopGeneratingMessages } from './session/generation-cancellation'
 // Re-export message operations from session/messages.ts
 export {
   insertMessage,
@@ -39,6 +40,13 @@ export {
   scheduleGenerateNameAndThreadName,
   scheduleGenerateThreadName,
 } from './session/naming'
+export {
+  continuePausedToolCall,
+  disableToolCallLimitPauseAndContinue,
+  isRetryableToolCallStep,
+  retryFromLastToolCallAfterApiError,
+  stopPausedToolCall,
+} from './session/orchestration'
 export { createLoadingPictures } from './session/pictures'
 // Re-export thread operations from session/threads.ts
 export {

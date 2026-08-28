@@ -54,6 +54,18 @@ describe('buildContextForAI', () => {
       expect(result.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4'])
     })
 
+    it('should exclude fork marker messages', () => {
+      const messages = [
+        createMessage('m1', 'user', 'Hello'),
+        { ...createMessage('fork-marker', 'assistant'), isForkMarker: true },
+        createMessage('m2', 'assistant', 'Hi there'),
+      ]
+
+      const result = buildContextForAI({ messages })
+
+      expect(result.map((m) => m.id)).toEqual(['m1', 'm2'])
+    })
+
     it('should return all messages when compactionPoints is empty array', () => {
       const messages = [createMessage('m1', 'user', 'Hello'), createMessage('m2', 'assistant', 'Hi')]
 
@@ -158,7 +170,7 @@ describe('buildContextForAI', () => {
       expect(result[0].id).toBe('summary-1')
     })
 
-    it('should fall back to all messages when boundary not found', () => {
+    it('should fall back without the orphaned summary when boundary not found', () => {
       const messages = [createMessage('m1', 'user', 'Hello'), createMessage('m2', 'assistant', 'Response')]
       const summary = createSummaryMessage('summary-1')
       const allMessages = [...messages, summary]
@@ -166,11 +178,13 @@ describe('buildContextForAI', () => {
 
       const result = buildContextForAI({ messages: allMessages, compactionPoints })
 
-      expect(result).toHaveLength(3)
-      expect(result.map((m) => m.id)).toEqual(['m1', 'm2', 'summary-1'])
+      // The summary belongs to an inapplicable point (its boundary lives on
+      // another branch); leaking it alongside full history would feed the
+      // model a summary of other content.
+      expect(result.map((m) => m.id)).toEqual(['m1', 'm2'])
     })
 
-    it('should work when summary message is not found', () => {
+    it('should fall back to all messages when summary message is not found', () => {
       const messages = [
         createMessage('m1', 'user', 'Old'),
         createMessage('m2', 'assistant', 'Boundary'),
@@ -181,7 +195,31 @@ describe('buildContextForAI', () => {
 
       const result = buildContextForAI({ messages, compactionPoints })
 
-      expect(result.map((m) => m.id)).toEqual(['m3', 'm4'])
+      // Half a compaction contract must not apply: without the summary standing
+      // in, cutting at the boundary would silently drop history (worst case the
+      // new reply generates with an empty context).
+      expect(result.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    })
+
+    it('should fall back to an older applicable compaction point when the latest is torn apart', () => {
+      const now = Date.now()
+      const messages = [
+        createMessage('m1', 'user', 'Old'),
+        createMessage('m2', 'assistant', 'First boundary'),
+        createSummaryMessage('summary-1', 'First summary'),
+        createMessage('m3', 'user', 'Follow-up'),
+        createMessage('m4', 'assistant', 'Second boundary'),
+        // summary-2 lives on a sibling fork branch: not in this path
+        createMessage('m5', 'user', 'Latest'),
+      ]
+      const compactionPoints = [
+        createCompactionPoint('summary-1', 'm2', now - 1000),
+        createCompactionPoint('summary-2', 'm4', now),
+      ]
+
+      const result = buildContextForAI({ messages, compactionPoints })
+
+      expect(result.map((m) => m.id)).toEqual(['summary-1', 'm3', 'm4', 'm5'])
     })
 
     it('should apply tool call cleanup to context messages', () => {

@@ -1,4 +1,4 @@
-import { Alert, Button, Flex, Group, Paper, Pill, Stack, Text, Title, Tooltip } from '@mantine/core'
+import { Alert, Button, Flex, Group, Paper, Pill, Stack, Text, Title } from '@mantine/core'
 import { SystemProviders } from '@shared/defaults'
 import type { KnowledgeBase, ProviderModelInfo } from '@shared/types'
 import type { DocumentParserConfig, DocumentParserType } from '@shared/types/settings'
@@ -10,6 +10,7 @@ import type React from 'react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Modal } from '@/components/layout/Overlay'
+import { AppTooltip as Tooltip } from '@/components/ui/tooltip'
 import { useProviders } from '@/hooks/useProviders'
 import { navigateToSettings } from '@/modals/Settings'
 import * as remote from '@/packages/remote'
@@ -264,7 +265,6 @@ const KnowledgeBasePage: React.FC = () => {
         return 'Chatbox AI'
       case 'mineru':
         return 'MinerU'
-      case 'local':
       default:
         return t('Local')
     }
@@ -283,7 +283,7 @@ const KnowledgeBasePage: React.FC = () => {
   }, [knowledgeBaseController, isUnsupportedPlatform, t])
 
   useEffect(() => {
-    fetchKbList()
+    void fetchKbList()
   }, [fetchKbList])
 
   // Check platform compatibility
@@ -298,7 +298,7 @@ const KnowledgeBasePage: React.FC = () => {
         console.error('Failed to check platform compatibility:', error)
       }
     }
-    checkPlatform()
+    void checkPlatform()
   }, [])
 
   // Fetch Chatbox AI models configuration
@@ -313,7 +313,7 @@ const KnowledgeBasePage: React.FC = () => {
         toastError(t('Failed to fetch Chatbox AI models config, Error: {{error}}', { error: error }))
       }
     }
-    fetchChatboxAIModels()
+    void fetchChatboxAIModels()
   }, [t])
 
   const createKb = async () => {
@@ -368,7 +368,7 @@ const KnowledgeBasePage: React.FC = () => {
       setNewVisionModel(null)
       setNewDocumentParser({ type: 'local' })
       setShowCreate(false)
-      fetchKbList()
+      await fetchKbList()
     } catch (e) {
       toastError(t('Failed to create knowledge base, Error: {{error}}', { error: e }))
     }
@@ -393,7 +393,7 @@ const KnowledgeBasePage: React.FC = () => {
       setEditKb(null)
       setEditRerankModel(null)
       setEditVisionModel(null)
-      fetchKbList()
+      await fetchKbList()
     } catch (e) {
       toastError(t('Failed to update knowledge base, Error: {{error}}', { error: e }))
     }
@@ -405,7 +405,7 @@ const KnowledgeBasePage: React.FC = () => {
       await knowledgeBaseController.delete(deleteConfirmKb.id)
       setDeleteConfirmKb(null)
       setEditKb(null) // Close edit modal if it's open
-      fetchKbList()
+      await fetchKbList()
     } catch (error) {
       console.error('Failed to delete knowledge base:', error)
     }
